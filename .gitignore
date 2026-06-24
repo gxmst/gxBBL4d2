@@ -1,0 +1,19 @@
+# Local workspace / Codex app state
+.agents/
+
+# Reference mods used for research; do not publish without checking licenses.
+Advanced Bot AI - Custom/
+Improved Bots (Advanced)/
+
+# Generated research data and packaged releases
+_extracted-params.json
+*.vpk
+
+# Runtime/debug output
+*.log
+
+# Editor/system noise
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
