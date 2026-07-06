@@ -10,7 +10,7 @@ Buddy Bots for L4D2.
 
 ## Status
 
-Current version: `0.7.0-player`
+Current version: `0.7.1-strength`
 
 This is experimental. It is built for single-player and local bot testing first.
 It does not replace the Source engine survivor AI. It nudges vanilla bot
@@ -38,8 +38,8 @@ Rule of thumb: randomize timing and style, not basic survival responsibility.
 - Per-bot roles: point, flanker, follower, anchor.
 - Per-bot personality profiles and roguelike-style bot cards.
 - Flow-based map advancement using nav flow when available.
-- Single action arbiter for move, attack, retreat, cover, assist, progress,
-  scout, idle, and optional scripted rescue actions.
+- Single action arbiter for move, attack, shove, retreat, cover, assist,
+  progress, scout, idle, and optional scripted rescue actions.
 - Emergency defense for pinned or incapacitated humans.
 - Callouts for pins, Tank/Witch spawns, downs, and heal intent.
 - Multiplayer guard that sleeps and restores cvars when more than one human is
@@ -156,7 +156,7 @@ Then restart L4D2 or reload the map.
 1. Disable other script addons that also ship `director_base_addon.nut`.
 2. Start a local map, for example `c1m1_hotel`.
 3. Run `scripted_user_func hbot_status`.
-4. Expected status includes `v0.7.0-player`, `mode=player`, `cards=true`,
+4. Expected status includes `v0.7.1-strength`, `mode=player`, `cards=true`,
    `progress=true`, `actions=true`, and `rescue=false`.
 5. Run `scripted_user_func hbot_mode_escort` to confirm old-style mode switching.
 

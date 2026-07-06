@@ -5,10 +5,11 @@
 // 0.6.3 adds emergency defense, stalled-map nudges, and idle micro-movement.
 // 0.7 makes "player" the default personality mode: bots act more like another
 // active teammate, while "escort" preserves the older human-centered behavior.
+// 0.7.1 fixes self-heal commitment and adds frequent close-threat shoves.
 
 if (!("GxLdBot" in getroottable())) {
 	::GxLdBot <- {
-		Version = "0.7.0-player",
+		Version = "0.7.1-strength",
 		Debug = false,
 		DebugFile = false,
 		Initialized = false,
@@ -35,6 +36,7 @@ if (!("GxLdBot" in getroottable())) {
 		Cards = {},
 		Action = {},
 		RetreatCooldownUntil = {},
+		ShoveCooldownUntil = {},
 		ArbiterEntity = null,
 		ActionDisabledCleaned = false,
 		Reviving = {},
@@ -72,6 +74,8 @@ if (!("GxLdBot" in getroottable())) {
 			ItemCuriosityMax = 100,
 			InteractionBiasMin = 30,
 			InteractionBiasMax = 100,
+			HealThresholdMin = 12,
+			HealThresholdMax = 45,
 			BaseFollowDistance = 220,
 			FollowDistanceJitter = 60,
 			MaxSeparation = 620,
@@ -121,6 +125,11 @@ if (!("GxLdBot" in getroottable())) {
 			EnableHeal = true,
 			ArbiterInterval = 0.18,
 			RescueShoveRange = 105.0,
+			HealDuration = 6.2,
+			CombatShoveRadius = 115.0,
+			CombatShoveSpecialRadius = 145.0,
+			CombatShoveDuration = 0.28,
+			CombatShoveCooldown = 0.38,
 			ReviveProximity = 100.0,
 			RetreatHpThreshold = 22,
 			RetreatCommonRadius = 120.0,
@@ -146,7 +155,7 @@ local gxldbotSetSlot = function(tbl, key, value) {
 	}
 };
 
-gxldbotSetSlot(GxLdBot, "Version", "0.7.0-player");
+gxldbotSetSlot(GxLdBot, "Version", "0.7.1-strength");
 gxldbotSetSlot(GxLdBot, "Initialized", false);
 gxldbotSetSlot(GxLdBot, "Sleeping", false);
 gxldbotSetSlot(GxLdBot, "SleepReason", "");
@@ -156,6 +165,7 @@ gxldbotSetSlot(GxLdBot, "LastAttack", {});
 gxldbotSetSlot(GxLdBot, "Cards", {});
 gxldbotSetSlot(GxLdBot, "Action", {});
 gxldbotSetSlot(GxLdBot, "RetreatCooldownUntil", {});
+gxldbotSetSlot(GxLdBot, "ShoveCooldownUntil", {});
 gxldbotSetSlot(GxLdBot, "ArbiterEntity", null);
 gxldbotSetSlot(GxLdBot, "ActionDisabledCleaned", false);
 gxldbotSetSlot(GxLdBot, "BTN_SHOVE", 2048);
@@ -201,6 +211,8 @@ local gxldbotDefaultSettings = {
 	ItemCuriosityMax = 100,
 	InteractionBiasMin = 30,
 	InteractionBiasMax = 100,
+	HealThresholdMin = 12,
+	HealThresholdMax = 45,
 	BaseFollowDistance = 220,
 	FollowDistanceJitter = 60,
 	MaxSeparation = 620,
@@ -250,6 +262,11 @@ local gxldbotDefaultSettings = {
 	EnableHeal = true,
 	ArbiterInterval = 0.18,
 	RescueShoveRange = 105.0,
+	HealDuration = 6.2,
+	CombatShoveRadius = 115.0,
+	CombatShoveSpecialRadius = 145.0,
+	CombatShoveDuration = 0.28,
+	CombatShoveCooldown = 0.38,
 	ReviveProximity = 100.0,
 	RetreatHpThreshold = 22,
 	RetreatCommonRadius = 120.0,
@@ -281,6 +298,8 @@ gxldbotSetSlot(GxLdBot, "ModePresets", {
 		ItemCuriosityMax = 100,
 		InteractionBiasMin = 45,
 		InteractionBiasMax = 100,
+		HealThresholdMin = 30,
+		HealThresholdMax = 62,
 		BaseFollowDistance = 240,
 		FollowDistanceJitter = 85,
 		MaxSeparation = 820,
@@ -305,7 +324,22 @@ gxldbotSetSlot(GxLdBot, "ModePresets", {
 		LeadFlowPerBias = 15.0,
 		IdleWanderRadius = 175.0,
 		IdleWaitBiasGate = 28,
-		IdleScoutAlways = true
+		IdleScoutAlways = true,
+		HealDuration = 6.2,
+		CombatShoveRadius = 135.0,
+		CombatShoveSpecialRadius = 180.0,
+		CombatShoveDuration = 0.30,
+		CombatShoveCooldown = 0.24,
+		RetreatHpThreshold = 16,
+		RetreatCommonCount = 8,
+		RetreatDuration = 0.25,
+		RetreatCooldown = 0.65,
+		AssistCommonRadius = 540.0,
+		AssistCommonCount = 1,
+		AssistMaxDistance = 1250.0,
+		AssistDuration = 1.35,
+		HealCombatRadius = 240.0,
+		HealCommonCount = 5
 	},
 	escort = {
 		label = "escort",
@@ -318,6 +352,8 @@ gxldbotSetSlot(GxLdBot, "ModePresets", {
 		ItemCuriosityMax = 100,
 		InteractionBiasMin = 30,
 		InteractionBiasMax = 100,
+		HealThresholdMin = 12,
+		HealThresholdMax = 45,
 		BaseFollowDistance = 220,
 		FollowDistanceJitter = 60,
 		MaxSeparation = 620,
@@ -342,7 +378,22 @@ gxldbotSetSlot(GxLdBot, "ModePresets", {
 		LeadFlowPerBias = 12.0,
 		IdleWanderRadius = 130.0,
 		IdleWaitBiasGate = 12,
-		IdleScoutAlways = true
+		IdleScoutAlways = true,
+		HealDuration = 6.2,
+		CombatShoveRadius = 115.0,
+		CombatShoveSpecialRadius = 145.0,
+		CombatShoveDuration = 0.28,
+		CombatShoveCooldown = 0.38,
+		RetreatHpThreshold = 22,
+		RetreatCommonCount = 6,
+		RetreatDuration = 0.35,
+		RetreatCooldown = 0.9,
+		AssistCommonRadius = 430.0,
+		AssistCommonCount = 2,
+		AssistMaxDistance = 900.0,
+		AssistDuration = 1.15,
+		HealCombatRadius = 300.0,
+		HealCommonCount = 3
 	},
 	safe = {
 		label = "safe",
@@ -355,6 +406,8 @@ gxldbotSetSlot(GxLdBot, "ModePresets", {
 		ItemCuriosityMax = 80,
 		InteractionBiasMin = 20,
 		InteractionBiasMax = 75,
+		HealThresholdMin = 22,
+		HealThresholdMax = 52,
 		BaseFollowDistance = 205,
 		FollowDistanceJitter = 45,
 		MaxSeparation = 520,
@@ -379,7 +432,22 @@ gxldbotSetSlot(GxLdBot, "ModePresets", {
 		LeadFlowPerBias = 7.0,
 		IdleWanderRadius = 90.0,
 		IdleWaitBiasGate = 8,
-		IdleScoutAlways = false
+		IdleScoutAlways = false,
+		HealDuration = 6.2,
+		CombatShoveRadius = 95.0,
+		CombatShoveSpecialRadius = 125.0,
+		CombatShoveDuration = 0.25,
+		CombatShoveCooldown = 0.65,
+		RetreatHpThreshold = 24,
+		RetreatCommonCount = 5,
+		RetreatDuration = 0.35,
+		RetreatCooldown = 1.1,
+		AssistCommonRadius = 380.0,
+		AssistCommonCount = 3,
+		AssistMaxDistance = 750.0,
+		AssistDuration = 1.0,
+		HealCombatRadius = 320.0,
+		HealCommonCount = 3
 	}
 });
 
@@ -440,27 +508,27 @@ gxldbotSetSlot(GxLdBot, "AggressiveCvars", {
 	allow_all_bot_survivor_team = 1,
 	sb_max_team_melee_weapons = 2,
 	sb_melee_approach_victim = 0,
-	sb_toughness_buffer = 300,
+	sb_toughness_buffer = 520,
 	sb_temp_health_consider_factor = 1.00,
 	sb_close_checkpoint_door_interval = 0.05,
 	sb_battlestation_human_hold_time = 0,
 	sb_enforce_proximity_lookat_timeout = 0.0,
-	sb_enforce_proximity_range = 520,
+	sb_enforce_proximity_range = 480,
 	sb_follow_stress_factor = 0,
 	sb_locomotion_wait_threshold = 0.0,
-	sb_path_lookahead_range = 2800,
+	sb_path_lookahead_range = 3600,
 	sb_sidestep_for_horde = 1,
-	sb_close_threat_range = 450,
-	sb_threat_close_range = 450,
-	sb_threat_very_close_range = 280,
-	sb_threat_medium_range = 900,
-	sb_threat_far_range = 3000,
-	sb_threat_very_far_range = 5000,
-	sb_near_hearing_range = 2400,
-	sb_far_hearing_range = 4600,
+	sb_close_threat_range = 560,
+	sb_threat_close_range = 560,
+	sb_threat_very_close_range = 360,
+	sb_threat_medium_range = 1200,
+	sb_threat_far_range = 4200,
+	sb_threat_very_far_range = 6500,
+	sb_near_hearing_range = 3400,
+	sb_far_hearing_range = 6500,
 	sb_combat_saccade_speed = 9999,
-	sb_normal_saccade_speed = 4000,
-	sb_use_button_range = 1000,
+	sb_normal_saccade_speed = 6500,
+	sb_use_button_range = 1200,
 	sb_vomit_blind_time = 0,
 	survivor_calm_damage_delay = 0,
 	survivor_calm_deploy_delay = 0,
@@ -905,6 +973,8 @@ function GxLdBot::MakeProfile(player) {
 	local itemMax = ("ItemCuriosityMax" in GxLdBot.Settings) ? GxLdBot.Settings.ItemCuriosityMax : 100;
 	local interactMin = ("InteractionBiasMin" in GxLdBot.Settings) ? GxLdBot.Settings.InteractionBiasMin : 30;
 	local interactMax = ("InteractionBiasMax" in GxLdBot.Settings) ? GxLdBot.Settings.InteractionBiasMax : 100;
+	local healMin = ("HealThresholdMin" in GxLdBot.Settings) ? GxLdBot.Settings.HealThresholdMin : 12;
+	local healMax = ("HealThresholdMax" in GxLdBot.Settings) ? GxLdBot.Settings.HealThresholdMax : 45;
 
 	local profile = {
 		name = GxLdBot.SafeName(player),
@@ -923,7 +993,7 @@ function GxLdBot::MakeProfile(player) {
 		waitBias = GxLdBot.RandInt(waitMin, waitMax),
 		interactionBias = GxLdBot.RandInt(interactMin, interactMax),
 		composureBase = GxLdBot.RandInt(55, 100),
-		healThreshold = GxLdBot.RandInt(12, 45),
+		healThreshold = GxLdBot.RandInt(healMin, healMax),
 		letItemBias = GxLdBot.RandInt(0, 60)
 	};
 
@@ -965,6 +1035,9 @@ function GxLdBot::ClearBotState(idx) {
 	}
 	if ("RetreatCooldownUntil" in GxLdBot && idx in GxLdBot.RetreatCooldownUntil) {
 		delete GxLdBot.RetreatCooldownUntil[idx];
+	}
+	if ("ShoveCooldownUntil" in GxLdBot && idx in GxLdBot.ShoveCooldownUntil) {
+		delete GxLdBot.ShoveCooldownUntil[idx];
 	}
 	if (idx in GxLdBot.Reviving) {
 		delete GxLdBot.Reviving[idx];
@@ -1856,6 +1929,7 @@ function GxLdBot::RoundStart() {
 	GxLdBot.LastAttack = {};
 	GxLdBot.Reviving = {};
 	GxLdBot.BeingRevived = {};
+	GxLdBot.ShoveCooldownUntil = {};
 	if ("HealIntent" in GxLdBot) {
 		GxLdBot.HealIntent = {};
 	}

@@ -7,12 +7,17 @@
 // stays vanilla; 0.4 adds only a narrow close-horde assist attack burst.
 //
 // Priority (high -> low):
-//   rescue > retreat > cover > assist > progress > scout > idle > (none -> reset to vanilla)
+//   rescue > defend > retreat > cover > heal > shove > escort > assist >
+//   progress > scout > idle > (none -> reset to vanilla)
 //   Rescue is off by default in 0.6 so vanilla rescue remains the normal path.
 //
 // Enactment primitives are all verified against the shipped Advanced Bot AI mod:
 //   CommandABot cmd 0/1/2/3, m_afButtonForced shove, SnapEyeAngles aim,
 //   m_iShovePenalty / m_flNextSecondaryAttack shove reset, pin NetProps.
+
+if (!("ShoveCooldownUntil" in GxLdBot)) {
+	GxLdBot.ShoveCooldownUntil <- {};
+}
 
 // ---- low-level enact primitives --------------------------------------------
 
@@ -213,6 +218,23 @@ function GxLdBot::HealIntentFor(bot) {
 	return true;
 }
 
+function GxLdBot::HealShouldContinue(bot, idx, now) {
+	if (!GxLdBot.Settings.EnableHeal || !GxLdBot.IsValidEntity(bot)) {
+		return false;
+	}
+	if (!(idx in GxLdBot.Action) || GxLdBot.Action[idx].kind != "heal") {
+		return false;
+	}
+	local a = GxLdBot.Action[idx];
+	if (now >= a.until) {
+		return false;
+	}
+	if (!("HasMedkit" in GxLdBot) || !GxLdBot.HasMedkit(bot)) {
+		return false;
+	}
+	return true;
+}
+
 function GxLdBot::ClearHeal(bot) {
 	if (!GxLdBot.IsValidEntity(bot)) {
 		return;
@@ -250,6 +272,47 @@ function GxLdBot::NearestCommonAround(origin, radius) {
 		}
 	} catch (e) {}
 	return best;
+}
+
+function GxLdBot::CombatShoveTargetFor(bot, idx, now) {
+	if (!GxLdBot.Settings.EnableShove || !GxLdBot.IsValidEntity(bot)) {
+		return null;
+	}
+
+	if (idx in GxLdBot.Action && GxLdBot.Action[idx].kind == "shove") {
+		local active = GxLdBot.Action[idx];
+		if (now < active.until && "target" in active && GxLdBot.IsValidEntity(active.target)) {
+			return active.target;
+		}
+	}
+
+	if (idx in GxLdBot.ShoveCooldownUntil && now < GxLdBot.ShoveCooldownUntil[idx]) {
+		return null;
+	}
+
+	local origin = null;
+	try { origin = bot.GetOrigin(); } catch (e) { return null; }
+
+	try {
+		local p = null;
+		local best = null;
+		local bestDist = 999999.0;
+		while (p = Entities.FindByClassnameWithin(p, "player", origin,
+				GxLdBot.Settings.CombatShoveSpecialRadius)) {
+			if (NetProps.GetPropInt(p, "m_iTeamNum") == 3 && !p.IsDead()) {
+				local d = (p.GetOrigin() - origin).Length();
+				if (d < bestDist) {
+					best = p;
+					bestDist = d;
+				}
+			}
+		}
+		if (best != null) {
+			return best;
+		}
+	} catch (e2) {}
+
+	return GxLdBot.NearestCommonAround(origin, GxLdBot.Settings.CombatShoveRadius);
 }
 
 function GxLdBot::ReviverFor(victim) {
@@ -729,18 +792,27 @@ function GxLdBot::ComputeIntent(bot, idx, now) {
 		}
 	}
 
-	// 5) heal self: force-use medkit when injured and combat is light
+	// 5) heal self: start only when safe, then commit long enough to finish.
+	if (GxLdBot.Settings.EnableHeal && GxLdBot.HealShouldContinue(bot, idx, now)) {
+		return { kind = "heal" };
+	}
 	if (GxLdBot.Settings.EnableHeal && GxLdBot.HealIntentFor(bot)) {
 		return { kind = "heal" };
 	}
 
-	// 6) catch up to the human before doing optional pressure actions.
+	// 6) frequent close-threat shove (right click) before optional movement.
+	local shoveTarget = GxLdBot.CombatShoveTargetFor(bot, idx, now);
+	if (shoveTarget != null) {
+		return { kind = "shove", target = shoveTarget };
+	}
+
+	// 7) catch up to the human before doing optional pressure actions.
 	local escort = GxLdBot.EscortIntentFor(bot);
 	if (escort != null) {
 		return { kind = "escort", pos = escort.pos, human = escort.human };
 	}
 
-	// 7) close-horde assist: short attack bursts to help clear swarmed teammates
+	// 8) close-horde assist: short attack bursts to help clear swarmed teammates
 	if (GxLdBot.Settings.EnableAssist) {
 		if (idx in GxLdBot.Action && GxLdBot.Action[idx].kind == "assist") {
 			local a = GxLdBot.Action[idx];
@@ -754,7 +826,7 @@ function GxLdBot::ComputeIntent(bot, idx, now) {
 		}
 	}
 
-	// 8) progress / scout (path clear). Flow-based map
+	// 9) progress / scout (path clear). Flow-based map
 	// advancement (progress.nut) is tried first so bots push toward the actual
 	// objective; the old human-relative scout is a fallback for maps with no
 	// usable flow (finales / survival).
@@ -769,7 +841,7 @@ function GxLdBot::ComputeIntent(bot, idx, now) {
 		return { kind = "scout", pos = spos };
 	}
 
-	// 9) idle (calm stall) — reuses social's decision
+	// 10) idle (calm stall) — reuses social's decision
 	local human = GxLdBot.IdleIntentFor(bot);
 	if (human != null) {
 		return { kind = "idle", human = human };
@@ -852,13 +924,13 @@ function GxLdBot::EnactIntent(bot, idx, intent, now) {
 			a = null;
 		}
 		if (a == null) {
-			a = { kind = "heal", since = now, until = now + 3.5,
+			a = { kind = "heal", since = now, until = now + GxLdBot.Settings.HealDuration,
 				ready = 0.0, target = null, pos = null, movedAt = 0.0, holding = false, claimKey = null };
 			GxLdBot.SetTableSlot(GxLdBot.Action, idx, a);
 			GxLdBot.Log("heal " + GxLdBot.SafeName(bot));
 			GxLdBot.Notify("action:heal:" + idx, GxLdBot.SafeName(bot) + " healing up", 6.0);
 		}
-		if (now >= a.until || !GxLdBot.HealIntentFor(bot)) {
+		if (!GxLdBot.HealShouldContinue(bot, idx, now)) {
 			GxLdBot.EndAction(bot, idx, true);
 			return;
 		}
@@ -869,6 +941,26 @@ function GxLdBot::EnactIntent(bot, idx, intent, now) {
 			}
 		} catch (e) {}
 		GxLdBot.ClearShove(bot);
+		return;
+	}
+
+	if (intent.kind == "shove") {
+		local a = (idx in GxLdBot.Action) ? GxLdBot.Action[idx] : null;
+		if (a != null && a.kind != "shove") {
+			GxLdBot.EndAction(bot, idx, true);
+			a = null;
+		}
+		if (a == null) {
+			local duration = GxLdBot.Settings.CombatShoveDuration;
+			a = { kind = "shove", since = now, until = now + duration,
+				ready = 0.0, target = intent.target, pos = null, movedAt = 0.0, holding = false, claimKey = null };
+			GxLdBot.SetTableSlot(GxLdBot.Action, idx, a);
+			GxLdBot.SetTableSlot(GxLdBot.ShoveCooldownUntil, idx,
+				now + duration + GxLdBot.Settings.CombatShoveCooldown);
+		}
+		a.target = intent.target;
+		GxLdBot.ClearHeal(bot);
+		GxLdBot.SetShove(bot, intent.target);
 		return;
 	}
 
@@ -1096,6 +1188,7 @@ function GxLdBot::ClearAllActions(doReset) {
 	}
 	GxLdBot.ForEachSurvivorBot(function(b) {
 		GxLdBot.ClearShove(b);
+		GxLdBot.ClearHeal(b);
 	});
 }
 
@@ -1206,9 +1299,11 @@ function GxLdBot::StartArbiterThink() {
 GxLdBot.RegisterRound("actions_reset", function() {
 	GxLdBot.Action = {};
 	GxLdBot.RetreatCooldownUntil = {};
+	GxLdBot.ShoveCooldownUntil = {};
 	GxLdBot.ActionDisabledCleaned = false;
 	GxLdBot.ForEachSurvivorBot(function(b) {
 		GxLdBot.ClearShove(b);
+		GxLdBot.ClearHeal(b);
 	});
 	GxLdBot.StartArbiterThink();
 });

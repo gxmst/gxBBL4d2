@@ -1,11 +1,12 @@
 # Buddy Bots for L4D2 / gxLdBot Development Notes
 
-Current branch: **0.7.0 player mode**. Building on the 0.6 guardian layer, this
+Current branch: **0.7.1 strength patch**. Building on the 0.7 player mode, this
 branch makes the default bot posture more like another active L4D2 player: bots
 can push map flow earlier, hold wider-but-bounded spacing, idle with more visible
 impatience, and still snap back to the same rescue/defense guardrails when the
-team is threatened. The older 0.6.3 escort feel is still available as
-`escort` mode.
+team is threatened. This patch also fixes self-heal commitment, adds frequent
+close-threat right-click shoves, and raises the default player-mode strength
+tuning. The older 0.6.3 escort feel is still available as `escort` mode.
 
 Small L4D2 VScript prototype exploring **more useful, more player-feeling
 survivor bots**. The original goal was believability; the newer branches
@@ -221,7 +222,7 @@ Type in chat during a local / scripted game:
 !hbot_roles       print assigned roles + spacing
 !hbot_focus       print current focus target per bot
 !hbot_claims      print active reservations
-!hbot_actions     print each bot's current arbiter action (rescue/defend/retreat/cover/heal/escort/assist/progress/scout/idle)
+!hbot_actions     print each bot's current arbiter action (rescue/defend/retreat/cover/heal/shove/escort/assist/progress/scout/idle)
 !hbot_regen       regenerate profiles + roles
 !hbot_debug       toggle verbose debug logging
 !hbot_debugfile   toggle writing debug log to gxldbot/debug.txt
@@ -242,7 +243,7 @@ Type in chat during a local / scripted game:
 !hbot_rescue      toggle experimental scripted rescue (off by default; vanilla rescue is normal)
 !hbot_retreat     toggle low-health swarm retreat
 !hbot_cover       toggle downed-teammate cover behavior
-!hbot_shove       toggle forced shove during rescue
+!hbot_shove       toggle forced shove during rescue and close-threat combat shoves
 !hbot_assist      toggle close-horde attack assist
 ```
 
@@ -425,6 +426,11 @@ From the aggressive-experiment (0.2.1) review — fixing three field-reported bu
     earlier flow pushes, more lead-biased roles, and more visible idle
     impatience. `escort` preserves the old 0.6.3-style human-centered behavior,
     and `safe` provides a quieter conservative debug profile.
+23. **0.7.1 strength patch.** Extends self-heal commitment to a full medkit
+    window, prevents heal actions from self-canceling against the stricter start
+    gates, adds close-threat combat shoves via right click, and raises default
+    `player` strength through earlier healing, stronger assist, less retreating,
+    wider threat/hearing ranges, and higher bot toughness cvars.
 
 ## Verified against working code
 
@@ -454,7 +460,7 @@ they degrade instead of crashing):
 - **Disable `Advanced Bot AI - Custom` while testing gxLdBot.** Both claim
   `director_base_addon.nut`; only one entry point wins. With both enabled you
   may think gxLdBot didn't load.
-- Quick smoke test: load a map, `!hbot_status` should print `v0.7.0-player`,
+- Quick smoke test: load a map, `!hbot_status` should print `v0.7.1-strength`,
   `mode=player`, `sleep=false`, `chat=true`, `mpGuard=true`, `cards=true`,
   `rescue=false`;
   `!hbot_cards` should show one card per bot and a reroll timer; `!hbot_roles`

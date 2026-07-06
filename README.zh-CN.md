@@ -8,7 +8,7 @@ Buddy Bots for L4D2 是一个 Left 4 Dead 2 的 VScript 模组原型，目标是
 
 ## 当前状态
 
-当前版本：`0.7.0-player`
+当前版本：`0.7.1-strength`
 
 这是实验性项目，优先面向单人 / 本地 bot 测试。它不会替换 Source 引擎底层的生还者 AI，而是在原版 bot 之上，通过 VScript、cvar、事件回调、`CommandABot` 和带保护的 NetProps 操作去做行为引导。
 
@@ -31,7 +31,7 @@ Buddy Bots for L4D2 是一个 Left 4 Dead 2 的 VScript 模组原型，目标是
 - bot 角色：point、flanker、follower、anchor。
 - 每个 bot 有性格档案和 roguelike 风格卡牌。
 - 可用地图 nav flow 时，bot 会基于流程距离主动推进。
-- 单一动作仲裁器，统一处理移动、攻击、撤退、掩护、协助、推进、侦察、idle 和可选脚本救援。
+- 单一动作仲裁器，统一处理移动、攻击、右键推、撤退、掩护、协助、推进、侦察、idle 和可选脚本救援。
 - 人类玩家被控或倒地时，触发紧急防守。
 - 特感控制、Tank/Witch、倒地、治疗意图等事件有语音 / 调试提示。
 - 多人保护：检测到超过一名人类玩家时休眠并恢复 cvar。
@@ -145,7 +145,7 @@ Left 4 Dead 2/left4dead2/addons/gxldbot.vpk
 1. 关闭其他也包含 `director_base_addon.nut` 的脚本 addon。
 2. 开一个本地地图，例如 `c1m1_hotel`。
 3. 运行 `scripted_user_func hbot_status`。
-4. 预期输出包含 `v0.7.0-player`、`mode=player`、`cards=true`、`progress=true`、`actions=true`、`rescue=false`。
+4. 预期输出包含 `v0.7.1-strength`、`mode=player`、`cards=true`、`progress=true`、`actions=true`、`rescue=false`。
 5. 运行 `scripted_user_func hbot_mode_escort`，确认可以切回旧护航风格。
 
 ## 仓库结构
