@@ -325,6 +325,19 @@ function GxLdBot::ProgressIntentFor(bot) {
 	// front (DESIGN 6.1 / 5.4 防孤立).
 	local isScout = ("IsScoutRole" in GxLdBot) && GxLdBot.IsScoutRole(profile);
 
+	// DYNAMIC ADVANCE (player request "few zombies -> push faster, many -> slow but
+	// don't stop"). Grade the combat around this scout: 0 clear, 1 light (commons
+	// crowding, no special), 2 heavy (special/witch or a real swarm). Severity 2
+	// still fully stops the advance below (safety); severity 1 lets it keep moving
+	// but shrinks the forward lead so it presses on cautiously instead of halting
+	// for a couple of trash commons.
+	local combatSev = 0;
+	if (("ScoutCombatSeverity" in GxLdBot)) {
+		combatSev = GxLdBot.ScoutCombatSeverity(bot, human);
+	} else if (("ScoutCombatNearby" in GxLdBot) && GxLdBot.ScoutCombatNearby(bot, human)) {
+		combatSev = 2; // fail-safe: no grader -> treat any combat as a hard stop
+	}
+
 	// PROACTIVE LEAD + SCOUT FORMATION (player's "I get lost on third-party maps, I
 	// want a bot walking ahead as a guide, not waiting for me to point the way").
 	// A scout carries a constant forward lead so it stays ahead as a living
@@ -342,6 +355,15 @@ function GxLdBot::ProgressIntentFor(bot) {
 			roleLead = roleLead * mul;
 		}
 		targetFlow += roleLead;
+	}
+
+	// Light combat (severity 1): keep advancing but shrink the lead so the bot
+	// presses forward cautiously rather than sprinting into a crowd. Multiplies the
+	// slice of targetFlow that sits AHEAD of the human, leaving base flow intact.
+	if (combatSev == 1 && humanFlow != null && targetFlow > humanFlow) {
+		local slowMul = ("DynamicSlowLeadMul" in GxLdBot.Settings)
+			? GxLdBot.Settings.DynamicSlowLeadMul : 0.5;
+		targetFlow = humanFlow + (targetFlow - humanFlow) * slowMul;
 	}
 
 	// Stall probe — THE §6.1 fix. When the human has been parked past
@@ -363,6 +385,21 @@ function GxLdBot::ProgressIntentFor(bot) {
 		}
 	}
 
+	// EXIT-SAFEROOM GUARD (DESIGN 5.5 point-of-no-return, #5 通关级 bug): once a
+	// survivor is inside the exit checkpoint, flow keeps rising into/through the
+	// door, so the strong forward lead used to shove a bot PAST the finish trigger
+	// into the dead zone behind it — then the human closes the door and the map is
+	// unwinnable with a bot stuck outside. While anyone is in the exit checkpoint,
+	// never let a bot's target flow exceed the human's: it may keep pace to the
+	// door but never run through it ahead of the player, who decides when to enter.
+	if (hasHuman && humanFlow != null && GxLdBot.Settings.EndpointHoldEnable
+			&& ("AnyoneInExitSaferoom" in GxLdBot) && GxLdBot.AnyoneInExitSaferoom()) {
+		local endCap = humanFlow + GxLdBot.Settings.EndpointHoldFlowMargin;
+		if (targetFlow > endCap) {
+			targetFlow = endCap;
+		}
+	}
+
 	// Already at/past our allowed lead. If we're a scout who has genuinely walked
 	// AHEAD of the human (leading), don't hand back to vanilla — vanilla's follow
 	// then walks us straight back to the human, which is the "来回蹭" shuffle the
@@ -370,9 +407,18 @@ function GxLdBot::ProgressIntentFor(bot) {
 	// human ("walked ahead, now I turn and wait / point the way"). Only when it's
 	// safe (no combat, not isolated); otherwise fall through to vanilla as before.
 	if (botFlow >= targetFlow - GxLdBot.Settings.ProgressFlowTolerance) {
+		// Guide-hold whenever this scout is genuinely AHEAD of the human (humanFlow <
+		// botFlow), moving or not. THE FIX for weak lead feel: the old code required
+		// !humanMoving here, so the moment you pressed W the scout skipped guide and
+		// returned null → vanilla follow yanked it back to your side (the "来回蹭 /
+		// no lead feel" shuffle). By holding the forward spot while you move, the bot
+		// stays out front as a breadcrumb and you walk up BEHIND it — then it re-pushes
+		// as you close the gap. Guarded by dispersion + no heavy combat so we never
+		// strand it. When the human passes the bot (humanFlow >= botFlow) this fails
+		// and progress re-pushes the bot ahead again.
 		if (isScout && human != null && humanFlow != null && humanFlow < botFlow
 				&& GxLdBot.BotCentroidDispersion(bot) <= GxLdBot.Settings.SquadDispersionMax
-				&& !(("ScoutCombatNearby" in GxLdBot) && GxLdBot.ScoutCombatNearby(bot, human))) {
+				&& combatSev < 2) {
 			return { guide = true, human = human };
 		}
 		return null;
@@ -416,16 +462,28 @@ function GxLdBot::ProgressIntentFor(bot) {
 		if (GxLdBot.DistanceBetween(bot, human) > maxSep) {
 			return null;
 		}
-		if (("ScoutCombatNearby" in GxLdBot) && GxLdBot.ScoutCombatNearby(bot, human)) {
+		// Dynamic advance: only a HEAVY threat (severity 2 — special/witch or a real
+		// swarm) fully stops forward pressure. Light crowding (severity 1) already
+		// had its lead throttled above, so the bot keeps advancing, just slower.
+		if (combatSev >= 2) {
 			return null;
 		}
 	}
 
 	// Throttle the (relatively costly) flow scan; reuse the cached target while
-	// it is still ahead of us and we have not arrived yet.
+	// it is still ahead of us and we have not arrived yet. While the human is
+	// MOVING we cut the interval (ScoutMovingInterval) so the scout re-targets
+	// crisply and stays ahead instead of lagging a beat behind a walking player
+	// (the "bot reacts slowly / trails me" feel). Parked human keeps the cheaper
+	// full interval.
 	local idx = bot.GetEntityIndex();
+	local scanInterval = GxLdBot.Settings.ProgressInterval;
+	if (("HumanIsMoving" in GxLdBot) && GxLdBot.HumanIsMoving()
+			&& ("ScoutMovingInterval" in GxLdBot.Settings)) {
+		scanInterval = GxLdBot.Settings.ScoutMovingInterval;
+	}
 	local last = (idx in GxLdBot.LastScout) ? GxLdBot.LastScout[idx] : -999.0;
-	if ((now - last) < GxLdBot.Settings.ProgressInterval &&
+	if ((now - last) < scanInterval &&
 			(idx in GxLdBot.LastScoutTarget) && GxLdBot.LastScoutTarget[idx] != null) {
 		local cached = GxLdBot.LastScoutTarget[idx];
 		local cacheHit = false;

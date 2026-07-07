@@ -34,7 +34,21 @@ if (-not (Test-Path -LiteralPath $VpkExe)) {
 }
 
 Write-Host "Packing $AddonDir"
+
+# Remove any stale output first so a FAILED pack can't leave the previous VPK
+# sitting there and get mistaken for a fresh build (and then installed).
+if (Test-Path -LiteralPath $OutputVpk) {
+	Remove-Item -LiteralPath $OutputVpk -Force
+}
+
 & $VpkExe $AddonDir
+
+# vpk.exe returns non-zero on failure — treat that as fatal instead of trusting
+# a leftover file. Combined with the pre-delete above, this guarantees we only
+# ever report/install a VPK that THIS run actually produced.
+if ($LASTEXITCODE -ne 0) {
+	throw "vpk.exe failed with exit code $LASTEXITCODE"
+}
 
 if (-not (Test-Path -LiteralPath $OutputVpk)) {
 	throw "Expected output not found: $OutputVpk"

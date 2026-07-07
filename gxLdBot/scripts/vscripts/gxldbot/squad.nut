@@ -419,6 +419,68 @@ function GxLdBot::ScoutCombatNearby(bot, human) {
 	return false;
 }
 
+// Count same-floor commons within radius of ent (a real count, unlike
+// ScoutCommonNear which stops at the first hit). Used to grade combat severity.
+function GxLdBot::ScoutCommonCountNear(ent, radius) {
+	if (!GxLdBot.IsValidEntity(ent)) {
+		return 0;
+	}
+	local count = 0;
+	local originZ = 0.0;
+	try { originZ = ent.GetOrigin().z; } catch (e) { return 0; }
+	try {
+		local infected = null;
+		while (infected = Entities.FindByClassnameWithin(infected, "infected",
+				ent.GetOrigin(), radius)) {
+			// same-floor only, reusing the Z-band that fixes multi-floor false hits
+			if (!("IsSameFloor" in GxLdBot) || GxLdBot.IsSameFloor(originZ, infected)) {
+				count++;
+			}
+		}
+	} catch (e2) {
+	}
+	return count;
+}
+
+// Grade the combat around a scout so progress can SLOW DOWN instead of fully
+// STOPPING for a couple of trash commons (player request: "zombies few → push
+// faster, zombies many → slow but don't stop"). Returns:
+//   0 = clear-ish (no special, commons below the slow threshold) → full speed
+//   1 = light (commons crowding but no special) → advance at reduced speed
+//   2 = heavy (a special/witch nearby, OR a genuine swarm) → hold, let combat run
+// A special ALWAYS grades 2 (must be handled), so this never weakens the
+// safety-relevant stop; it only relaxes the stop for pure trash commons.
+function GxLdBot::ScoutCombatSeverity(bot, human) {
+	local closeRadius = GxLdBot.Settings.ScoutCombatRadius;
+	local specialRadius = GxLdBot.Settings.ScoutSpecialCombatRadius;
+
+	// Master switch: when dynamic advance is OFF, fall back to the old binary
+	// behavior — any combat nearby is a hard stop (severity 2), no slow-down tier.
+	if (!GxLdBot.Settings.DynamicAdvanceEnable) {
+		return GxLdBot.ScoutCombatNearby(bot, human) ? 2 : 0;
+	}
+
+	if (GxLdBot.ScoutSpecialNear(bot, specialRadius) ||
+			GxLdBot.ScoutSpecialNear(human, specialRadius)) {
+		return 2; // special/witch in play — always hold
+	}
+
+	local nBot = GxLdBot.ScoutCommonCountNear(bot, closeRadius);
+	local nHuman = GxLdBot.IsValidEntity(human)
+		? GxLdBot.ScoutCommonCountNear(human, closeRadius) : 0;
+	local n = (nBot > nHuman) ? nBot : nHuman;
+
+	local heavy = GxLdBot.Settings.DynamicHeavyCommonCount;
+	local slow = GxLdBot.Settings.DynamicSlowCommonCount;
+	if (n >= heavy) {
+		return 2; // a real swarm — hold and clear it
+	}
+	if (n >= slow) {
+		return 1; // crowding — slow but keep moving
+	}
+	return 0; // a stray common or two — full speed ahead
+}
+
 // NOTE: general combat (commons + specials that have NOT pinned anyone) is
 // intentionally left to the vanilla engine AI. The old CombatNudgeTick /
 // CombatTargetFor were removed in 0.3 — the only genuinely useful case,

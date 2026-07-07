@@ -1055,7 +1055,13 @@ function GxLdBot::ComputeIntent(bot, idx, now) {
 		// travel-with-the-human, and even that only while the human is actually moving
 		// and it isn't a real emergency.
 		local selfDefense = ("AssistIsSelfDefense" in GxLdBot) && GxLdBot.AssistIsSelfDefense(bot);
-		local humanMoving = ("HumanIsMoving" in GxLdBot) && GxLdBot.HumanIsMoving();
+		// AssistYieldWhenMoving=false restores always-on assist (never yield travel to
+		// the moving human). When true (default) a moving human suppresses non-self
+		// assist so bots travel WITH the player instead of peeling off to farm trash.
+		local yieldWhenMoving = (!("AssistYieldWhenMoving" in GxLdBot.Settings))
+			|| GxLdBot.Settings.AssistYieldWhenMoving;
+		local humanMoving = yieldWhenMoving
+			&& ("HumanIsMoving" in GxLdBot) && GxLdBot.HumanIsMoving();
 		local emergency = ("TeamEmergency" in GxLdBot) && GxLdBot.TeamEmergency();
 		if (selfDefense || !humanMoving || emergency) {
 			local assistTarget = GxLdBot.AssistTargetFor(bot);
@@ -1396,7 +1402,8 @@ function GxLdBot::EnactIntent(bot, idx, intent, now) {
 			local holdPos = null;
 			try { holdPos = bot.GetOrigin(); } catch (e) {}
 			a = { kind = "guide", since = now, until = 0.0, ready = 0.0,
-				target = intent.human, pos = holdPos, movedAt = now, holding = true, claimKey = null };
+				target = intent.human, pos = holdPos, basePos = holdPos, fidgetAt = now,
+				movedAt = now, holding = true, claimKey = null };
 			GxLdBot.SetTableSlot(GxLdBot.Action, idx, a);
 			GxLdBot.Notify("action:guide:" + idx,
 				GxLdBot.SafeName(bot) + " leading the way", 12.0);
@@ -1407,6 +1414,21 @@ function GxLdBot::EnactIntent(bot, idx, intent, now) {
 		// has actually drifted off (vanilla nudge / knockback) or periodically, NOT
 		// every tick — re-issuing a move order every 0.18s to the spot it's already on
 		// makes it micro-path and jitter (that's the "左右来回走" the player reported).
+		// Living micro-movement: every FidgetInterval-ish seconds shift the hold
+		// spot a small bounded step off the ORIGINAL arrival point (basePos), so a
+		// waiting scout repositions like a real player instead of freezing. Bounded
+		// by FidgetRadius so it never drifts off station.
+		if ("basePos" in a && a.basePos != null
+				&& ("FidgetEnable" in GxLdBot.Settings) && GxLdBot.Settings.FidgetEnable
+				&& now >= a.fidgetAt) {
+			a.fidgetAt = now + GxLdBot.RandFloat(GxLdBot.Settings.FidgetInterval * 0.6,
+				GxLdBot.Settings.FidgetInterval * 1.4);
+			local r = GxLdBot.Settings.FidgetRadius;
+			local ang = GxLdBot.RandFloat(0.0, 6.283);
+			local dist = GxLdBot.RandFloat(r * 0.35, r);
+			a.pos = Vector(a.basePos.x + cos(ang) * dist, a.basePos.y + sin(ang) * dist,
+				a.basePos.z);
+		}
 		if (a.pos != null) {
 			local drift = 0.0;
 			try { drift = (bot.GetOrigin() - a.pos).Length(); } catch (e2) {}
@@ -1545,9 +1567,17 @@ function GxLdBot::ActionArbiterTick() {
 		}
 
 		if (GxLdBot.IsUncommandable(bot)) {
+			// LADDER FIX (the "climbs to the middle then falls / gets stuck" bug):
+			// EndAction's reset issues BotResetCommand (cmd=3), which INTERRUPTS the
+			// engine's in-progress ladder traversal and drops the bot off partway up.
+			// While on a ladder (movetype 9) release our action state WITHOUT the reset
+			// so vanilla finishes the climb uninterrupted. ClearShove/Heal/Goof only
+			// drop forced button bits and don't affect the climb, so they stay.
+			local onLadder = false;
+			try { onLadder = (NetProps.GetPropInt(bot, "movetype") == 9); } catch (el) {}
 			if (idx in GxLdBot.Action) {
-				GxLdBot.EndAction(bot, idx, true);
-			} else {
+				GxLdBot.EndAction(bot, idx, !onLadder);
+			} else if (!onLadder) {
 				GxLdBot.ClearShove(bot);
 			}
 			return;
@@ -1626,6 +1656,7 @@ GxLdBot.RegisterRound("actions_reset", function() {
 	GxLdBot.ForEachSurvivorBot(function(b) {
 		GxLdBot.ClearShove(b);
 		GxLdBot.ClearHeal(b);
+		if ("ClearGoof" in GxLdBot) { GxLdBot.ClearGoof(b); }
 	});
 	GxLdBot.StartArbiterThink();
 });

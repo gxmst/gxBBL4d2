@@ -27,75 +27,96 @@ gxldbotCardSet("CardRarityWeight", { common = 14, rare = 8, legendary = 5 });
 gxldbotCardSet("CardDefs", [
 	{
 		id = "rookie", name = "Rookie", rarity = "common",
-		desc = "green but eager, jumpy under pressure",
-		followAdd = 40, leadAdd = -8, progressLeadAdd = -120, reactionMul = 1.35,
-		composureAdd = -22, waitAdd = 18, retreatHpAdd = 15, retreatCountAdd = -2,
+		desc = "green and jumpy: slow to react, rattles easily",
+		followAdd = 30, leadAdd = -8, progressLeadAdd = -90, reactionMul = 1.45,
+		composureAdd = -28, waitAdd = 20, retreatHpAdd = 15, retreatCountAdd = -2,
 		signature = "",
 	},
 	{
 		id = "steady", name = "Steady", rarity = "common",
-		desc = "dependable mid-line teammate",
-		followAdd = 0, leadAdd = 0, reactionMul = 1.0, composureAdd = 5,
+		desc = "dependable mid-line teammate, no drama",
+		followAdd = 0, leadAdd = 0, reactionMul = 0.95, composureAdd = 8,
 		signature = "",
 	},
 	{
 		id = "sweeper", name = "Sweeper", rarity = "common",
-		desc = "turns close-horde assist on earlier and longer",
+		desc = "loves clearing horde: assists earlier, wider, longer",
 		followAdd = 20, leadAdd = 8, assistCountAdd = -3, assistRadiusAdd = 190,
-		assistMaxAdd = 300, assistDurationAdd = 0.45, reactionMul = 0.82,
+		assistMaxAdd = 300, assistDurationAdd = 0.5, reactionMul = 0.8,
 		signature = "",
 	},
 	{
 		id = "bodyguard", name = "Bodyguard", rarity = "common",
-		desc = "sticks to the human, clears nearby pressure",
-		followAdd = -70, leadAdd = -24, progressLeadAdd = -240, maxSepAdd = -180,
+		desc = "glued to you: protective, clears your space, revives fast",
+		followAdd = -60, leadAdd = -20, progressLeadAdd = -140, maxSepAdd = -120,
 		assistCountAdd = -2, assistRadiusAdd = 130, assistMaxAdd = 200,
-		composureAdd = 12, retreatHpAdd = 8,
+		composureAdd = 14, rescueAdd = 16, retreatHpAdd = 8,
 		signature = "",
 	},
 	{
-		id = "skittish", name = "Skittish", rarity = "common",
-		desc = "stays close, retreats early and often",
-		followAdd = -60, leadAdd = -22, progressLeadAdd = -300, maxSepAdd = -180,
-		reactionMul = 1.12, composureAdd = -10, retreatHpAdd = 28,
-		retreatCountAdd = -3,
+		id = "triggerhappy", name = "Trigger-Happy", rarity = "common",
+		desc = "twitchy spray-and-pray: snaps fast, jumpy, wastes ammo",
+		followAdd = 25, leadAdd = 6, reactionMul = 0.68, composureAdd = -16,
+		assistRadiusAdd = 120, assistCountAdd = -1, retreatHpAdd = 6,
 		signature = "",
 	},
 	{
 		id = "vanguard", name = "Vanguard", rarity = "rare",
-		desc = "pushes map flow hard, accepts wider spacing",
-		followAdd = 70, leadAdd = 22, progressLeadAdd = 260, maxSepAdd = 100,
-		reactionMul = 0.92, composureAdd = 8, retreatCountAdd = 4, retreatHpAdd = -10,
+		desc = "pushes the map hard, accepts wider spacing",
+		followAdd = 55, leadAdd = 20, progressLeadAdd = 150, maxSepAdd = 90,
+		reactionMul = 0.9, composureAdd = 10, retreatCountAdd = 4, retreatHpAdd = -10,
 		signature = "",
 	},
 	{
 		id = "ranger", name = "Ranger", rarity = "rare",
-		desc = "light-footed flanker, moves a step quicker",
-		followAdd = 45, leadAdd = 14, progressLeadAdd = 160, maxSepAdd = 70,
-		reactionMul = 0.86, assistRadiusAdd = 80, assistMaxAdd = 180,
-		speedMul = 1.10, signature = "fleet-footed",
+		desc = "light-footed flanker, moves a clear step quicker",
+		followAdd = 35, leadAdd = 12, progressLeadAdd = 120, maxSepAdd = 60,
+		reactionMul = 0.85, assistRadiusAdd = 80, assistMaxAdd = 180,
+		speedMul = 1.12, signature = "fleet-footed",
 	},
 	{
 		id = "berserker", name = "Berserker", rarity = "rare",
-		desc = "fast and brave, but bad at backing off",
-		followAdd = 55, leadAdd = 20, progressLeadAdd = 200, maxSepAdd = 80,
-		reactionMul = 0.72, composureAdd = -8, retreatHpAdd = -18,
-		retreatCountAdd = 5, assistCountAdd = -1,
-		signature = "",
+		desc = "fearless brawler: lightning reactions, hates backing off",
+		followAdd = 40, leadAdd = 16, progressLeadAdd = 120, maxSepAdd = 80,
+		reactionMul = 0.62, composureAdd = -6, retreatHpAdd = -22,
+		retreatCountAdd = 6, assistCountAdd = -2,
+		signature = "bloodlust",
+	},
+	{
+		id = "guardian", name = "Guardian", rarity = "rare",
+		desc = "team protector: drops everything to rescue, stays composed",
+		followAdd = -30, leadAdd = -8, progressLeadAdd = -80, maxSepAdd = -60,
+		reactionMul = 0.8, composureAdd = 18, rescueAdd = 30,
+		assistDurationAdd = 0.4, retreatHpAdd = 4,
+		signature = "guardian angel",
+	},
+	{
+		id = "zen", name = "Zen", rarity = "rare",
+		desc = "unshakeable: never panics, deliberate, patient",
+		followAdd = 0, leadAdd = 4, reactionMul = 0.9, composureAdd = 32,
+		waitAdd = 14, retreatHpAdd = -6,
+		signature = "unshakeable",
 	},
 	{
 		id = "veteran", name = "Veteran", rarity = "legendary",
-		desc = "rock-steady carry: fast, brave, never tilts",
-		followAdd = 10, leadAdd = 12, progressLeadAdd = 130, reactionMul = 0.62,
-		composureAdd = 28, rescueAdd = 10, assistCountAdd = -1, retreatHpAdd = -5,
+		desc = "rock-steady carry: razor reactions, ice-cold nerves",
+		followAdd = 10, leadAdd = 12, progressLeadAdd = 120, reactionMul = 0.55,
+		composureAdd = 32, rescueAdd = 12, assistCountAdd = -1, retreatHpAdd = -5,
 		signature = "ice in the veins",
 	},
 	{
 		id = "sprinter", name = "Sprinter", rarity = "legendary",
-		desc = "hyper-mobile scout, noticeably faster on foot",
-		followAdd = 60, leadAdd = 20, progressLeadAdd = 320, maxSepAdd = 120,
-		reactionMul = 0.9, composureAdd = 5,
-		speedMul = 1.25, signature = "quicksilver",
+		desc = "quicksilver scout: noticeably faster on foot, ranges ahead",
+		followAdd = 45, leadAdd = 18, progressLeadAdd = 150, maxSepAdd = 100,
+		reactionMul = 0.85, composureAdd = 6,
+		speedMul = 1.28, signature = "quicksilver",
+	},
+	{
+		id = "ace", name = "Ace", rarity = "legendary",
+		desc = "the complete player: fast, calm, mobile, always there for you",
+		followAdd = 15, leadAdd = 12, progressLeadAdd = 130, maxSepAdd = 60,
+		reactionMul = 0.6, composureAdd = 22, rescueAdd = 14, speedMul = 1.14,
+		signature = "the ace",
 	},
 ]);
 
@@ -242,8 +263,22 @@ function GxLdBot::AssignCard(idx, reason = "roll", excludeCurrent = false, force
 		who = GxLdBot.Profiles[idx].name;
 	}
 	local verb = (reason == "timed" || reason == "command") ? "rerolled" : "drew";
-	GxLdBot.Notify("card:" + idx + ":" + reason, who + " " + verb +
-		" card: " + card.name, (reason == "initial") ? 6.0 : 0.0);
+	// Rarity visual feedback (DESIGN #2): a legendary draw reads as an EVENT, not a
+	// line of log. Prefix by rarity + hold the toast longer for rare/legendary so
+	// pulling an Ace feels like a pull, not a stat change.
+	local rarity = ("rarity" in card) ? card.rarity : "common";
+	local prefix = "";
+	local hold = (reason == "initial") ? 6.0 : 0.0;
+	if (rarity == "legendary") {
+		prefix = "*** LEGENDARY *** ";
+		hold = 8.0;
+	} else if (rarity == "rare") {
+		prefix = "** RARE ** ";
+		if (hold < 5.0) { hold = 5.0; }
+	}
+	local sig = ("signature" in card && card.signature != "") ? (" (" + card.signature + ")") : "";
+	GxLdBot.Notify("card:" + idx + ":" + reason, prefix + who + " " + verb +
+		" card: " + card.name + sig, hold);
 	return card;
 }
 

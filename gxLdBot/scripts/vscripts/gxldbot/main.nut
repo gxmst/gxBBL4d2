@@ -80,6 +80,7 @@ gxldbotSetSlot(GxLdBot, "BTN_DUCK", 4); // IN_DUCK — used by the goof-off teab
 gxldbotSetSlot(GxLdBot, "Goof", {});
 gxldbotSetSlot(GxLdBot, "GoofTeam", { lastStart = -999.0, joinUntil = -999.0 }); // shared teabag timing
 gxldbotSetSlot(GxLdBot, "SpeedBots", {}); // idx -> lagged-movement multiplier for movespeed cards
+gxldbotSetSlot(GxLdBot, "Fidget", {}); // idx -> guide-hold living micro-movement clock
 gxldbotSetSlot(GxLdBot, "Reviving", {});
 gxldbotSetSlot(GxLdBot, "BeingRevived", {});
 gxldbotSetSlot(GxLdBot, "RoundStartOrigin", null);
@@ -316,6 +317,15 @@ function GxLdBot::SetSleeping(value, reason) {
 	}
 
 	GxLdBot.Log("woke from sleep guard", true);
+	// Sleep did RestoreMildCvars(); waking must RE-APPLY our tuning, else the bots
+	// run on vanilla cvar values until the next thing that happens to re-push them
+	// (e.g. a second human leaving mid-session left the team on restored spacing).
+	if ("ApplyMildCvars" in GxLdBot) {
+		GxLdBot.ApplyMildCvars();
+	}
+	if ("ApplyTeamSpacing" in GxLdBot) {
+		GxLdBot.ApplyTeamSpacing();
+	}
 	if ("StartArbiterThink" in GxLdBot) {
 		GxLdBot.StartArbiterThink();
 	}
@@ -758,6 +768,17 @@ function GxLdBot::MakeProfile(player) {
 }
 
 function GxLdBot::ClearBotState(idx) {
+	// Drop any forced button bits (shove/use/duck) BEFORE we forget this bot, so a
+	// taken-over / swapped-out / round-edge bot never keeps a stuck forced key. The
+	// entity may already be gone (stale cleanup) — guard everything.
+	try {
+		local ent = EntIndexToHScript(idx);
+		if (ent != null && GxLdBot.IsValidEntity(ent)) {
+			if ("ClearShove" in GxLdBot) { GxLdBot.ClearShove(ent); }
+			if ("ClearHeal" in GxLdBot) { GxLdBot.ClearHeal(ent); }
+			if ("ClearGoof" in GxLdBot) { GxLdBot.ClearGoof(ent); }
+		}
+	} catch (e) {}
 	if (idx in GxLdBot.Profiles) {
 		delete GxLdBot.Profiles[idx];
 	}
@@ -784,6 +805,9 @@ function GxLdBot::ClearBotState(idx) {
 	}
 	if ("SpeedBots" in GxLdBot && idx in GxLdBot.SpeedBots) {
 		delete GxLdBot.SpeedBots[idx];
+	}
+	if ("Fidget" in GxLdBot && idx in GxLdBot.Fidget) {
+		delete GxLdBot.Fidget[idx];
 	}
 	if ("Cards" in GxLdBot && idx in GxLdBot.Cards) {
 		delete GxLdBot.Cards[idx];
@@ -1020,6 +1044,20 @@ function GxLdBot::BotInStartArea(ent) {
 	return false;
 }
 
+// True once any survivor has entered the EXIT/end saferoom (the checkpoint at the
+// end of a level). Used to STOP bots from pushing past the human into the exit and
+// getting sealed outside the closing door — the "point of no return" bug where a
+// bot bolted through the exit, the human closed the door, and someone was stuck
+// outside so the level couldn't finish (DESIGN 5.5). Fail-safe: if the Director
+// call is unavailable, returns false (no suppression) rather than throwing.
+function GxLdBot::AnyoneInExitSaferoom() {
+	try {
+		return Director.IsAnySurvivorInExitCheckpoint();
+	} catch (e) {
+	}
+	return false;
+}
+
 function GxLdBot::TeamMovedSinceRoundStart() {
 	if (GxLdBot.RoundStartOrigin == null) {
 		return false;
@@ -1048,8 +1086,12 @@ function GxLdBot::UpdateDynamicCvars() {
 		GxLdBot.TrackedSetCvar("sb_threat_very_far_range", 9000);
 		GxLdBot.TrackedSetCvar("sb_near_hearing_range", 5000);
 		GxLdBot.TrackedSetCvar("sb_far_hearing_range", 9000);
-		GxLdBot.TrackedSetCvar("sb_combat_saccade_speed", 9999);
-		GxLdBot.TrackedSetCvar("sb_normal_saccade_speed", 9999);
+		// Match the stable aggressive aim values (4500/2200) — NOT 9999. An over-fast
+		// saccade makes the bot's aim jitter/overshoot and MISS, exactly when a rescue
+		// needs to land shots. Emergency already boosts perception ranges above; the aim
+		// tracking stays at the tuned snappy-but-settling value.
+		GxLdBot.TrackedSetCvar("sb_combat_saccade_speed", 4500);
+		GxLdBot.TrackedSetCvar("sb_normal_saccade_speed", 2200);
 		GxLdBot.TrackedSetCvar("sb_separation_range", 90);
 		GxLdBot.TrackedSetCvar("sb_neighbor_range", 140);
 		return;
@@ -1383,6 +1425,15 @@ function GxLdBot::HandleCommand(player, text) {
 
 	if (text == "!hbot_cards_toggle") {
 		GxLdBot.Settings.EnableCards = !GxLdBot.Settings.EnableCards;
+		// When turning cards OFF, CardsThink() early-returns and stops writing
+		// m_flLaggedMovementValue — so any speed a speed-card / rubber-band wrote
+		// last tick stays stuck. Restore every bot to vanilla movespeed (1.0) so
+		// "cards=false" actually means normal speed, not a frozen fast/slow value.
+		if (!GxLdBot.Settings.EnableCards) {
+			GxLdBot.ForEachSurvivorBot(function(bot) {
+				try { NetProps.SetPropFloat(bot, "m_flLaggedMovementValue", 1.0); } catch (e) {}
+			});
+		}
 		if ("AssignRoles" in GxLdBot) {
 			GxLdBot.AssignRoles();
 		}
@@ -1781,6 +1832,7 @@ function GxLdBot::RoundStart() {
 	GxLdBot.LastAttack = {};
 	GxLdBot.Goof = {};
 	GxLdBot.SpeedBots = {};
+	GxLdBot.Fidget = {};
 	GxLdBot.Reviving = {};
 	GxLdBot.BeingRevived = {};
 	GxLdBot.ShoveCooldownUntil = {};

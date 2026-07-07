@@ -96,7 +96,23 @@ GxLdBot.DefaultSettings <- {
 	ScoutRepeatInterval = 4.0,
 	ScoutCombatRadius = 340.0,
 	ScoutSpecialCombatRadius = 1000.0,
+	// Dynamic advance (player request #3/#4): instead of a hard STOP whenever any
+	// zombie is near, forward pressure SLOWS with threat and only stops for real
+	// danger. Severity 0 (clear / a stray common) = full speed; 1 (a genuine crowd
+	// of commons, count >= DynamicSlowCommonCount, no special) = advance but with a
+	// reduced forward lead (lead x DynamicSlowLeadMul, so it steps forward more
+	// cautiously, never freezes); 2 (any special/witch nearby, or an overwhelming
+	// common mob, count >= DynamicHeavyCommonCount) = hold and let combat resolve.
+	// Set DynamicAdvanceEnable=false for the old binary stop.
+	DynamicAdvanceEnable = true,
+	DynamicSlowCommonCount = 4,
+	DynamicHeavyCommonCount = 9,
+	DynamicSlowLeadMul = 0.5,
 	ProgressInterval = 0.6,
+	// While the human is actively moving, re-target this often (much shorter
+	// than ProgressInterval) so a leading scout stays AHEAD instead of lagging a
+	// beat behind the player who is holding W (fix for "bot just trails me").
+	ScoutMovingInterval = 0.2,
 	ProgressScanRadius = 900.0,
 	ProgressMaxAreas = 96,
 	// Gradient-flow pathing (layer-2, nav-probe verified): instead of scanning the
@@ -110,6 +126,16 @@ GxLdBot.DefaultSettings <- {
 	ProgressRetargetDistance = 90.0,
 	ProgressMaxLeadFlow = 760.0,
 	StallProbeExtraFlow = 220.0,
+	// Endpoint protection (DESIGN 5.5 point-of-no-return): once ANY survivor has
+	// entered the exit saferoom, a bot must NOT push its flow past the human's —
+	// otherwise the aggressive lead walks it through the exit door / into a
+	// close-off dead zone, and closing the saferoom strands it outside (a
+	// run-ending bug). true = clamp lead to the human once the exit is in play.
+	EndpointHoldEnable = true,
+	// Small flow slack a bot may still lead by while the exit is in play — enough
+	// to stay at the doorway with the human, not enough to run through it. Keep
+	// well below the door's flow depth so a bot never crosses the finish trigger.
+	EndpointHoldFlowMargin = 60.0,
 	// Constant forward lead (flow units) the POINT bot carries so it walks ahead
 	// as a living breadcrumb even while the human creeps along (fixes "I get lost,
 	// no bot leads the way"). The flanker gets ScoutLeadFlow * ScoutFlankerLeadMul
@@ -133,7 +159,15 @@ GxLdBot.DefaultSettings <- {
 	EnableCover = true,
 	EnableShove = true,
 	EnableAssist = true,
-	EnableHeal = true,
+	// Scripted self-heal is OFF: the enact path only forced BTN_USE, which does
+	// NOT trigger a medkit self-heal in L4D2 (that needs equip-medkit + attack),
+	// so a low-HP bot would just stand pressing a no-op key for HealDuration —
+	// AND heal outranks escort/progress/guide in the arbiter, so the rear bot got
+	// stuck in place not advancing (player report "last bot freezes behind").
+	// Vanilla already self-heals bots when safe (README roadmap note), so we hand
+	// it back to vanilla instead of half-driving it. Re-enable only if the full
+	// FL_FROZEN + equip + force-attack recipe is implemented in the enact block.
+	EnableHeal = false,
 	ArbiterInterval = 0.18,
 	RescueShoveRange = 105.0,
 	// Max distance a bot will commit to a scripted rescue. Beyond this, don't pull
@@ -158,6 +192,17 @@ GxLdBot.DefaultSettings <- {
 	// is ~128-200 units; 110 accepts same-floor slopes/stairs but rejects a zombie
 	// a full storey up/down. Kills the "shove/swing at unreachable air" bug.
 	ReachableMaxZ = 110.0,
+	// Living micro-movement (player request "bots look inert, standing statue-still").
+	// While a scout holds a guide point or a bot idles, it does small idle fidgets:
+	// it shifts its hold spot by up to FidgetRadius every FidgetInterval-ish seconds
+	// (a weight-shift / reposition, not a march), and looks around instead of
+	// laser-locking the human — a subtle "alive, waiting" tell. All bounded so it
+	// never drifts off station or re-creates the old "左右来回蹭" jitter. Set
+	// FidgetEnable=false for dead-still holds.
+	FidgetEnable = true,
+	FidgetRadius = 55.0,
+	FidgetInterval = 2.6,
+	FidgetLookChance = 35,
 	// Goof-off (DESIGN 6.3): zero-physical-risk idle antics near the human when
 	// nothing else to do — crouch-spam (teabag) + face the human. No shove
 	// (griefing risk), no flashlight yet (needs a verified NetProp).
