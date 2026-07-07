@@ -6,10 +6,13 @@
 // 0.7 makes "player" the default personality mode: bots act more like another
 // active teammate, while "escort" preserves the older human-centered behavior.
 // 0.7.1 fixes self-heal commitment and adds frequent close-threat shoves.
+// 1.0 first release: layered situation blackboard, flow gradient pathing, guide
+// hold + two-group formation, rubber-band catch-up speed, self-defense-aware
+// assist gating, roguelike cards with movespeed tiers, ladder hand-off, teabag.
 
 if (!("GxLdBot" in getroottable())) {
 	::GxLdBot <- {
-		Version = "0.7.1-strength",
+		Version = "1.0",
 		Debug = false,
 		DebugFile = false,
 		Initialized = false,
@@ -46,104 +49,7 @@ if (!("GxLdBot" in getroottable())) {
 		CvarDefaultsLoaded = false,
 		EmergencyCvarsActive = false,
 		ThinkHooks = [],
-		RoundHooks = [],
-		Settings = {
-			Mode = "player",
-			EnableMildCvars = true,
-			EnableProfiles = true,
-			EnableObservation = true,
-			EnableDebugFile = false,
-			EnableChatEvents = true,
-			EnableMultiplayerGuard = true,
-			EnableCallouts = true,
-			EnableRoles = true,
-			EnableFocus = true,
-			EnableClaims = true,
-			EnableComposure = true,
-			EnableResourceStyle = true,
-			EnableIdle = true,
-			EnableCards = true,
-			EnableScout = true,
-			EnableProgress = true,
-			DebugBufferLimit = 80,
-			PersonalLeadMin = 35,
-			PersonalLeadMax = 100,
-			WaitBiasMin = 0,
-			WaitBiasMax = 60,
-			ItemCuriosityMin = 30,
-			ItemCuriosityMax = 100,
-			InteractionBiasMin = 30,
-			InteractionBiasMax = 100,
-			HealThresholdMin = 12,
-			HealThresholdMax = 45,
-			BaseFollowDistance = 220,
-			FollowDistanceJitter = 60,
-			MaxSeparation = 620,
-			EscortCatchupDistance = 420.0,
-			ActiveAdvanceDelay = 6.0,
-			ActiveAdvanceFlowBoost = 180.0,
-			StallSeconds = 4.0,
-			TeamMoveThreshold = 55.0,
-			DebugStatusInterval = 5.0,
-			RescueDelayMin = 0.25,
-			RescueDelayMax = 1.1,
-			CalloutCooldown = 0.9,
-			ThreatScanRadius = 1450.0,
-			FocusSwitchCost = 0.22,
-			ClaimExpiry = 1.8,
-			ScoutInterval = 0.65,
-			ScoutAheadDistance = 320.0,
-			ScoutSideOffset = 160.0,
-			ScoutMaxHumanDistance = 480.0,
-			ScoutMinRetargetDistance = 120.0,
-			ScoutRepeatTargetDistance = 260.0,
-			ScoutRepeatInterval = 4.0,
-			ScoutCombatRadius = 340.0,
-			ScoutSpecialCombatRadius = 1000.0,
-			ProgressInterval = 0.6,
-			ProgressScanRadius = 900.0,
-			ProgressMaxAreas = 96,
-			ProgressMinAdvanceFlow = 15.0,
-			ProgressFlowTolerance = 50.0,
-			ProgressRetargetDistance = 90.0,
-			ProgressMaxLeadFlow = 760.0,
-			LeadFlowPerBias = 12.0,
-			EmergencyThreatRadius = 1800.0,
-			EmergencyCommonRadius = 650.0,
-			EmergencyAssistMultiplier = 2.0,
-			IdleWanderRadius = 130.0,
-			IdleWaitBiasGate = 12,
-			IdleScoutAlways = true,
-			CardRerollInterval = 300.0,
-			CardRerollChance = 22,
-			EnableActions = true,
-			EnableRescue = false,
-			EnableRetreat = true,
-			EnableCover = true,
-			EnableShove = true,
-			EnableAssist = true,
-			EnableHeal = true,
-			ArbiterInterval = 0.18,
-			RescueShoveRange = 105.0,
-			HealDuration = 6.2,
-			CombatShoveRadius = 115.0,
-			CombatShoveSpecialRadius = 145.0,
-			CombatShoveDuration = 0.28,
-			CombatShoveCooldown = 0.38,
-			ReviveProximity = 100.0,
-			RetreatHpThreshold = 22,
-			RetreatCommonRadius = 120.0,
-			RetreatCommonCount = 6,
-			RetreatDuration = 0.35,
-			RetreatCooldown = 0.9,
-			CoverGuardDistance = 220.0,
-			AssistCommonRadius = 430.0,
-			AssistCommonCount = 2,
-			AssistMaxDistance = 900.0,
-			AssistDuration = 1.15,
-			HealCombatRadius = 300.0,
-			HealCommonCount = 3
-		}
+		RoundHooks = []
 	};
 }
 
@@ -155,7 +61,7 @@ local gxldbotSetSlot = function(tbl, key, value) {
 	}
 };
 
-gxldbotSetSlot(GxLdBot, "Version", "0.7.1-strength");
+gxldbotSetSlot(GxLdBot, "Version", "1.0");
 gxldbotSetSlot(GxLdBot, "Initialized", false);
 gxldbotSetSlot(GxLdBot, "Sleeping", false);
 gxldbotSetSlot(GxLdBot, "SleepReason", "");
@@ -170,6 +76,10 @@ gxldbotSetSlot(GxLdBot, "ArbiterEntity", null);
 gxldbotSetSlot(GxLdBot, "ActionDisabledCleaned", false);
 gxldbotSetSlot(GxLdBot, "BTN_SHOVE", 2048);
 gxldbotSetSlot(GxLdBot, "BTN_USE", 32);
+gxldbotSetSlot(GxLdBot, "BTN_DUCK", 4); // IN_DUCK — used by the goof-off teabag
+gxldbotSetSlot(GxLdBot, "Goof", {});
+gxldbotSetSlot(GxLdBot, "GoofTeam", { lastStart = -999.0, joinUntil = -999.0 }); // shared teabag timing
+gxldbotSetSlot(GxLdBot, "SpeedBots", {}); // idx -> lagged-movement multiplier for movespeed cards
 gxldbotSetSlot(GxLdBot, "Reviving", {});
 gxldbotSetSlot(GxLdBot, "BeingRevived", {});
 gxldbotSetSlot(GxLdBot, "RoundStartOrigin", null);
@@ -180,276 +90,12 @@ gxldbotSetSlot(GxLdBot, "CvarDefaultsLoaded", false);
 gxldbotSetSlot(GxLdBot, "EmergencyCvarsActive", false);
 gxldbotSetSlot(GxLdBot, "ThinkHooks", []);
 gxldbotSetSlot(GxLdBot, "RoundHooks", []);
-if (!("Settings" in GxLdBot)) {
-	GxLdBot.Settings <- {};
-}
-
-local gxldbotDefaultSettings = {
-	Mode = "player",
-	EnableMildCvars = true,
-	EnableProfiles = true,
-	EnableObservation = true,
-	EnableDebugFile = false,
-	EnableChatEvents = true,
-	EnableMultiplayerGuard = true,
-	EnableCallouts = true,
-	EnableRoles = true,
-	EnableFocus = true,
-	EnableClaims = true,
-	EnableComposure = true,
-	EnableResourceStyle = true,
-	EnableIdle = true,
-	EnableCards = true,
-	EnableScout = true,
-	EnableProgress = true,
-	DebugBufferLimit = 80,
-	PersonalLeadMin = 35,
-	PersonalLeadMax = 100,
-	WaitBiasMin = 0,
-	WaitBiasMax = 60,
-	ItemCuriosityMin = 30,
-	ItemCuriosityMax = 100,
-	InteractionBiasMin = 30,
-	InteractionBiasMax = 100,
-	HealThresholdMin = 12,
-	HealThresholdMax = 45,
-	BaseFollowDistance = 220,
-	FollowDistanceJitter = 60,
-	MaxSeparation = 620,
-	EscortCatchupDistance = 420.0,
-	ActiveAdvanceDelay = 6.0,
-	ActiveAdvanceFlowBoost = 180.0,
-	StallSeconds = 4.0,
-	TeamMoveThreshold = 55.0,
-	DebugStatusInterval = 5.0,
-	RescueDelayMin = 0.25,
-	RescueDelayMax = 1.1,
-	CalloutCooldown = 0.9,
-	ThreatScanRadius = 1450.0,
-	FocusSwitchCost = 0.22,
-	ClaimExpiry = 1.8,
-	ScoutInterval = 0.65,
-	ScoutAheadDistance = 320.0,
-	ScoutSideOffset = 160.0,
-	ScoutMaxHumanDistance = 480.0,
-	ScoutMinRetargetDistance = 120.0,
-	ScoutRepeatTargetDistance = 260.0,
-	ScoutRepeatInterval = 4.0,
-	ScoutCombatRadius = 340.0,
-	ScoutSpecialCombatRadius = 1000.0,
-	ProgressInterval = 0.6,
-	ProgressScanRadius = 900.0,
-	ProgressMaxAreas = 96,
-	ProgressMinAdvanceFlow = 15.0,
-	ProgressFlowTolerance = 50.0,
-	ProgressRetargetDistance = 90.0,
-	ProgressMaxLeadFlow = 760.0,
-	LeadFlowPerBias = 12.0,
-	EmergencyThreatRadius = 1800.0,
-	EmergencyCommonRadius = 650.0,
-	EmergencyAssistMultiplier = 2.0,
-	IdleWanderRadius = 130.0,
-	IdleWaitBiasGate = 12,
-	IdleScoutAlways = true,
-	CardRerollInterval = 300.0,
-	CardRerollChance = 22,
-	EnableActions = true,
-	EnableRescue = false,
-	EnableRetreat = true,
-	EnableCover = true,
-	EnableShove = true,
-	EnableAssist = true,
-	EnableHeal = true,
-	ArbiterInterval = 0.18,
-	RescueShoveRange = 105.0,
-	HealDuration = 6.2,
-	CombatShoveRadius = 115.0,
-	CombatShoveSpecialRadius = 145.0,
-	CombatShoveDuration = 0.28,
-	CombatShoveCooldown = 0.38,
-	ReviveProximity = 100.0,
-	RetreatHpThreshold = 22,
-	RetreatCommonRadius = 120.0,
-	RetreatCommonCount = 6,
-	RetreatDuration = 0.35,
-	RetreatCooldown = 0.9,
-	CoverGuardDistance = 220.0,
-	AssistCommonRadius = 430.0,
-	AssistCommonCount = 2,
-	AssistMaxDistance = 900.0,
-	AssistDuration = 1.15,
-	HealCombatRadius = 300.0,
-	HealCommonCount = 3
-};
-
-foreach (key, value in gxldbotDefaultSettings) {
-	gxldbotSetSlot(GxLdBot.Settings, key, value);
-}
-
-gxldbotSetSlot(GxLdBot, "ModePresets", {
-	player = {
-		label = "player",
-		desc = "active player-like buddy",
-		PersonalLeadMin = 45,
-		PersonalLeadMax = 100,
-		WaitBiasMin = 0,
-		WaitBiasMax = 75,
-		ItemCuriosityMin = 45,
-		ItemCuriosityMax = 100,
-		InteractionBiasMin = 45,
-		InteractionBiasMax = 100,
-		HealThresholdMin = 30,
-		HealThresholdMax = 62,
-		BaseFollowDistance = 240,
-		FollowDistanceJitter = 85,
-		MaxSeparation = 820,
-		EscortCatchupDistance = 640.0,
-		ActiveAdvanceDelay = 2.8,
-		ActiveAdvanceFlowBoost = 280.0,
-		StallSeconds = 3.0,
-		ScoutAheadDistance = 430.0,
-		ScoutSideOffset = 190.0,
-		ScoutMaxHumanDistance = 700.0,
-		ScoutMinRetargetDistance = 105.0,
-		ScoutRepeatTargetDistance = 230.0,
-		ScoutRepeatInterval = 3.2,
-		ScoutCombatRadius = 330.0,
-		ScoutSpecialCombatRadius = 1100.0,
-		ProgressInterval = 0.45,
-		ProgressScanRadius = 1050.0,
-		ProgressMinAdvanceFlow = 12.0,
-		ProgressFlowTolerance = 38.0,
-		ProgressRetargetDistance = 80.0,
-		ProgressMaxLeadFlow = 980.0,
-		LeadFlowPerBias = 15.0,
-		IdleWanderRadius = 175.0,
-		IdleWaitBiasGate = 28,
-		IdleScoutAlways = true,
-		HealDuration = 6.2,
-		CombatShoveRadius = 135.0,
-		CombatShoveSpecialRadius = 180.0,
-		CombatShoveDuration = 0.30,
-		CombatShoveCooldown = 0.24,
-		RetreatHpThreshold = 16,
-		RetreatCommonCount = 8,
-		RetreatDuration = 0.25,
-		RetreatCooldown = 0.65,
-		AssistCommonRadius = 540.0,
-		AssistCommonCount = 1,
-		AssistMaxDistance = 1250.0,
-		AssistDuration = 1.35,
-		HealCombatRadius = 240.0,
-		HealCommonCount = 5
-	},
-	escort = {
-		label = "escort",
-		desc = "0.6.3 human-centered escort behavior",
-		PersonalLeadMin = 35,
-		PersonalLeadMax = 100,
-		WaitBiasMin = 0,
-		WaitBiasMax = 60,
-		ItemCuriosityMin = 30,
-		ItemCuriosityMax = 100,
-		InteractionBiasMin = 30,
-		InteractionBiasMax = 100,
-		HealThresholdMin = 12,
-		HealThresholdMax = 45,
-		BaseFollowDistance = 220,
-		FollowDistanceJitter = 60,
-		MaxSeparation = 620,
-		EscortCatchupDistance = 420.0,
-		ActiveAdvanceDelay = 6.0,
-		ActiveAdvanceFlowBoost = 180.0,
-		StallSeconds = 4.0,
-		ScoutAheadDistance = 320.0,
-		ScoutSideOffset = 160.0,
-		ScoutMaxHumanDistance = 480.0,
-		ScoutMinRetargetDistance = 120.0,
-		ScoutRepeatTargetDistance = 260.0,
-		ScoutRepeatInterval = 4.0,
-		ScoutCombatRadius = 340.0,
-		ScoutSpecialCombatRadius = 1000.0,
-		ProgressInterval = 0.6,
-		ProgressScanRadius = 900.0,
-		ProgressMinAdvanceFlow = 15.0,
-		ProgressFlowTolerance = 50.0,
-		ProgressRetargetDistance = 90.0,
-		ProgressMaxLeadFlow = 760.0,
-		LeadFlowPerBias = 12.0,
-		IdleWanderRadius = 130.0,
-		IdleWaitBiasGate = 12,
-		IdleScoutAlways = true,
-		HealDuration = 6.2,
-		CombatShoveRadius = 115.0,
-		CombatShoveSpecialRadius = 145.0,
-		CombatShoveDuration = 0.28,
-		CombatShoveCooldown = 0.38,
-		RetreatHpThreshold = 22,
-		RetreatCommonCount = 6,
-		RetreatDuration = 0.35,
-		RetreatCooldown = 0.9,
-		AssistCommonRadius = 430.0,
-		AssistCommonCount = 2,
-		AssistMaxDistance = 900.0,
-		AssistDuration = 1.15,
-		HealCombatRadius = 300.0,
-		HealCommonCount = 3
-	},
-	safe = {
-		label = "safe",
-		desc = "conservative debug-friendly behavior",
-		PersonalLeadMin = 20,
-		PersonalLeadMax = 80,
-		WaitBiasMin = 5,
-		WaitBiasMax = 70,
-		ItemCuriosityMin = 20,
-		ItemCuriosityMax = 80,
-		InteractionBiasMin = 20,
-		InteractionBiasMax = 75,
-		HealThresholdMin = 22,
-		HealThresholdMax = 52,
-		BaseFollowDistance = 205,
-		FollowDistanceJitter = 45,
-		MaxSeparation = 520,
-		EscortCatchupDistance = 340.0,
-		ActiveAdvanceDelay = 8.0,
-		ActiveAdvanceFlowBoost = 90.0,
-		StallSeconds = 6.0,
-		ScoutAheadDistance = 240.0,
-		ScoutSideOffset = 120.0,
-		ScoutMaxHumanDistance = 380.0,
-		ScoutMinRetargetDistance = 140.0,
-		ScoutRepeatTargetDistance = 300.0,
-		ScoutRepeatInterval = 5.0,
-		ScoutCombatRadius = 380.0,
-		ScoutSpecialCombatRadius = 1200.0,
-		ProgressInterval = 0.8,
-		ProgressScanRadius = 700.0,
-		ProgressMinAdvanceFlow = 25.0,
-		ProgressFlowTolerance = 70.0,
-		ProgressRetargetDistance = 110.0,
-		ProgressMaxLeadFlow = 420.0,
-		LeadFlowPerBias = 7.0,
-		IdleWanderRadius = 90.0,
-		IdleWaitBiasGate = 8,
-		IdleScoutAlways = false,
-		HealDuration = 6.2,
-		CombatShoveRadius = 95.0,
-		CombatShoveSpecialRadius = 125.0,
-		CombatShoveDuration = 0.25,
-		CombatShoveCooldown = 0.65,
-		RetreatHpThreshold = 24,
-		RetreatCommonCount = 5,
-		RetreatDuration = 0.35,
-		RetreatCooldown = 1.1,
-		AssistCommonRadius = 380.0,
-		AssistCommonCount = 3,
-		AssistMaxDistance = 750.0,
-		AssistDuration = 1.0,
-		HealCombatRadius = 320.0,
-		HealCommonCount = 3
-	}
-});
+// Settings + ModePresets now live in the config module (DESIGN 7.2): the
+// single authoritative source of tunables, included before any behavior
+// module reads GxLdBot.Settings. ApplyDefaultSettings() inside it does the
+// same UNCONDITIONAL write-back the old foreach did, so it still survives
+// L4D2 map transitions without a separate Settings seed here.
+IncludeScript("gxldbot/config");
 
 gxldbotSetSlot(GxLdBot, "CvarDefaults", {
 	sb_friend_immobilized_reaction_time_normal = 0.001,
@@ -506,7 +152,10 @@ gxldbotSetSlot(GxLdBot, "AggressiveCvars", {
 	sb_allow_shoot_through_survivors = 1,
 	sb_all_bot_game = 1,
 	allow_all_bot_survivor_team = 1,
-	sb_max_team_melee_weapons = 2,
+	// Guns only (player request): 0 = bots never equip/keep a melee weapon, so
+	// they always shoot instead of running in to swing. sb_melee_approach_victim
+	// off too so nobody charges a target to melee it.
+	sb_max_team_melee_weapons = 0,
 	sb_melee_approach_victim = 0,
 	sb_toughness_buffer = 520,
 	sb_temp_health_consider_factor = 1.00,
@@ -526,8 +175,12 @@ gxldbotSetSlot(GxLdBot, "AggressiveCvars", {
 	sb_threat_very_far_range = 6500,
 	sb_near_hearing_range = 3400,
 	sb_far_hearing_range = 6500,
-	sb_combat_saccade_speed = 9999,
-	sb_normal_saccade_speed = 6500,
+	// Guns-only combat. Aim tracking is crisper than vanilla (2000/350) but NOT
+	// cranked to the max — an over-fast saccade makes the bot's aim jitter/overshoot
+	// and MISS, which is why accuracy felt low last build. These values track
+	// targets snappily while still settling enough to land shots.
+	sb_combat_saccade_speed = 4500,
+	sb_normal_saccade_speed = 2200,
 	sb_use_button_range = 1200,
 	sb_vomit_blind_time = 0,
 	survivor_calm_damage_delay = 0,
@@ -837,6 +490,105 @@ function GxLdBot::DistanceBetween(a, b) {
 	}
 }
 
+// L4D2 SPATIAL TRAP: FindByClassnameWithin is a SPHERE test, so a zombie one
+// floor up/down (or behind a wall) counts as "nearby" even though the bot can't
+// reach it. That produced the "bot shoves empty air" / "bot stops shooting to
+// swing at an unreachable target" bugs. These helpers add a vertical (Z) band so
+// only same-floor, plausibly-reachable infected count. Not a true reachability
+// test (that needs nav tracing) but it kills the common multi-floor false hits.
+function GxLdBot::IsSameFloor(originZ, ent) {
+	if (!GxLdBot.IsValidEntity(ent)) {
+		return false;
+	}
+	try {
+		local dz = ent.GetOrigin().z - originZ;
+		if (dz < 0) { dz = -dz; }
+		return dz <= GxLdBot.Settings.ReachableMaxZ;
+	} catch (e) {
+		return false;
+	}
+}
+
+// Count commons within radius AND on roughly the same floor as origin.
+function GxLdBot::CountReachableCommons(origin, radius) {
+	local count = 0;
+	local originZ = origin.z;
+	try {
+		local ent = null;
+		while (ent = Entities.FindByClassnameWithin(ent, "infected", origin, radius)) {
+			if (GxLdBot.IsSameFloor(originZ, ent)) {
+				count++;
+			}
+		}
+	} catch (e) {}
+	return count;
+}
+
+// Nearest common within radius AND on the same floor, or null.
+function GxLdBot::NearestReachableCommon(origin, radius) {
+	local best = null;
+	local bestDist = 999999.0;
+	local originZ = origin.z;
+	try {
+		local ent = null;
+		while (ent = Entities.FindByClassnameWithin(ent, "infected", origin, radius)) {
+			if (!GxLdBot.IsSameFloor(originZ, ent)) {
+				continue;
+			}
+			local d = (ent.GetOrigin() - origin).Length();
+			if (d < bestDist) {
+				best = ent;
+				bestDist = d;
+			}
+		}
+	} catch (e) {}
+	return best;
+}
+
+// Nearest live special-infected (team 3 player) within radius AND same floor, or
+// null. Specials pinning a teammate are handled elsewhere; this is for "a special
+// is right here on my floor" combat gating.
+function GxLdBot::NearestReachableSpecial(origin, radius) {
+	local best = null;
+	local bestDist = 999999.0;
+	local originZ = origin.z;
+	try {
+		local p = null;
+		while (p = Entities.FindByClassnameWithin(p, "player", origin, radius)) {
+			try {
+				if (NetProps.GetPropInt(p, "m_iTeamNum") != 3 || p.IsDead()) {
+					continue;
+				}
+			} catch (ep) { continue; }
+			if (!GxLdBot.IsSameFloor(originZ, p)) {
+				continue;
+			}
+			local d = (p.GetOrigin() - origin).Length();
+			if (d < bestDist) {
+				best = p;
+				bestDist = d;
+			}
+		}
+	} catch (e) {}
+	return best;
+}
+
+// Is this infected a Tank? Zombie class 8. Shoving a Tank does nothing (it can't
+// be staggered by a melee shove), so shove logic excludes Tanks — trying to shove
+// one is the "bot melee-swings uselessly next to the Tank" bug.
+function GxLdBot::IsTank(ent) {
+	if (!GxLdBot.IsValidEntity(ent)) {
+		return false;
+	}
+	try {
+		return NetProps.GetPropInt(ent, "m_zombieClass") == 8;
+	} catch (e) {}
+	try {
+		return ent.GetClassname() == "tank";
+	} catch (e2) {}
+	return false;
+}
+
 // Closest alive human survivor to the given entity, or null.
 function GxLdBot::NearestHuman(toEnt) {
 	local best = null;
@@ -1026,6 +778,12 @@ function GxLdBot::ClearBotState(idx) {
 	}
 	if (idx in GxLdBot.LastAttack) {
 		delete GxLdBot.LastAttack[idx];
+	}
+	if ("Goof" in GxLdBot && idx in GxLdBot.Goof) {
+		delete GxLdBot.Goof[idx];
+	}
+	if ("SpeedBots" in GxLdBot && idx in GxLdBot.SpeedBots) {
+		delete GxLdBot.SpeedBots[idx];
 	}
 	if ("Cards" in GxLdBot && idx in GxLdBot.Cards) {
 		delete GxLdBot.Cards[idx];
@@ -1326,6 +1084,41 @@ function GxLdBot::TeamCentroid() {
 	return sum.Scale(1.0 / count.tofloat());
 }
 
+// Distance from a bot to the squad centroid. The 回身找你 backstop (DESIGN 6.2 /
+// 5.5) uses this: a bot whose dispersion exceeds SquadDispersionMax is the
+// isolated, unsupportable outlier and must return to the group regardless of the
+// forward probe it was running. The centroid includes every alive survivor
+// (humans + bots), so "the group" is the whole squad, not just the tethered human.
+// Cached team centroid. The arbiter calls BotCentroidDispersion for several bots
+// every ~0.18s tick; each call would otherwise re-loop every survivor. Time()
+// is constant within a tick, so caching on the timestamp collapses N loops per
+// tick into one (this was a measurable perf-warning source).
+function GxLdBot::TeamCentroidCached() {
+	local now = GxLdBot.Now();
+	if ("CentroidCacheTime" in GxLdBot && GxLdBot.CentroidCacheTime == now) {
+		return GxLdBot.CentroidCacheValue;
+	}
+	local c = GxLdBot.TeamCentroid();
+	GxLdBot.SetTableSlot(GxLdBot, "CentroidCacheTime", now);
+	GxLdBot.SetTableSlot(GxLdBot, "CentroidCacheValue", c);
+	return c;
+}
+
+function GxLdBot::BotCentroidDispersion(bot) {
+	if (!GxLdBot.IsValidEntity(bot)) {
+		return 0.0;
+	}
+	local c = GxLdBot.TeamCentroidCached();
+	if (c == null) {
+		return 0.0;
+	}
+	try {
+		return (bot.GetOrigin() - c).Length();
+	} catch (e) {
+		return 0.0;
+	}
+}
+
 function GxLdBot::HumanCentroid() {
 	local count = 0;
 	local sum = Vector(0, 0, 0);
@@ -1439,12 +1232,32 @@ function GxLdBot::PrintStatus(player) {
 		" assist=" + GxLdBot.Settings.EnableAssist);
 }
 
+// One-shot aggregate dump: status + roles + actions + progress in a single
+// command, so testing needs no memorizing of individual !hbot_ verbs. Wired to
+// both "!hbot_dump" (chat) and "hbot_dump" (scripted_user_func console, no
+// sv_cheats needed).
+function GxLdBot::PrintDump(player) {
+	GxLdBot.Chat(player, "==== gxLdBot dump ====");
+	GxLdBot.PrintStatus(player);
+	GxLdBot.Chat(player, "-- roles --");
+	if ("PrintRoles" in GxLdBot) { GxLdBot.SafeCall("dump_roles", function() { GxLdBot.PrintRoles(player); }); }
+	GxLdBot.Chat(player, "-- actions --");
+	if ("PrintActions" in GxLdBot) { GxLdBot.SafeCall("dump_actions", function() { GxLdBot.PrintActions(player); }); }
+	GxLdBot.Chat(player, "-- progress --");
+	if ("PrintProgress" in GxLdBot) { GxLdBot.SafeCall("dump_progress", function() { GxLdBot.PrintProgress(player); }); }
+	GxLdBot.Chat(player, "==== end dump ====");
+}
+
 function GxLdBot::NormalizeCommandText(text) {
 	if (text == null) {
 		return "";
 	}
 
 	local cmd = text.tolower();
+	// Strip leading/trailing whitespace: "scripted_user_func hbot_dump " (with a
+	// trailing space, easy to type) used to fail the exact-match dispatch and
+	// silently do nothing. strip() is a Squirrel global.
+	try { cmd = strip(cmd); } catch (e) {}
 	if (cmd.len() <= 0) {
 		return cmd;
 	}
@@ -1493,6 +1306,20 @@ function GxLdBot::HandleCommand(player, text) {
 
 	if (text == "!hbot_status") {
 		GxLdBot.PrintStatus(player);
+		return true;
+	}
+
+	if (text == "!hbot_dump") {
+		GxLdBot.SafeCall("cmd_dump", function() { GxLdBot.PrintDump(player); });
+		return true;
+	}
+
+	if (text == "!hbot_goof") {
+		GxLdBot.Settings.EnableGoof = !GxLdBot.Settings.EnableGoof;
+		if (!GxLdBot.Settings.EnableGoof) {
+			GxLdBot.ForEachSurvivorBot(function(b) { GxLdBot.ClearGoof(b); });
+		}
+		GxLdBot.Chat(player, "goof=" + GxLdBot.Settings.EnableGoof);
 		return true;
 	}
 
@@ -1624,6 +1451,24 @@ function GxLdBot::HandleCommand(player, text) {
 		return true;
 	}
 
+	if (text == "!hbot_navprobe") {
+		GxLdBot.SafeCall("cmd_navprobe", function() {
+			if (!("NavProbe" in GxLdBot)) {
+				try {
+					IncludeScript("gxldbot/progress");
+				} catch (e) {
+					GxLdBot.Log("include progress retry failed: " + e, true);
+				}
+			}
+			if ("NavProbe" in GxLdBot) {
+				GxLdBot.NavProbe(player);
+			} else {
+				GxLdBot.Chat(player, "navprobe not loaded");
+			}
+		});
+		return true;
+	}
+
 	if (text == "!hbot_actions_toggle") {
 		GxLdBot.Settings.EnableActions = !GxLdBot.Settings.EnableActions;
 		if (!GxLdBot.Settings.EnableActions && "ClearAllActions" in GxLdBot) {
@@ -1715,13 +1560,20 @@ function GxLdBot::HandleCommand(player, text) {
 		return true;
 	}
 
+	if (text == "!hbot_goof") {
+		GxLdBot.Settings.EnableGoof = !GxLdBot.Settings.EnableGoof;
+		GxLdBot.Chat(player, "goof=" + GxLdBot.Settings.EnableGoof);
+		return true;
+	}
+
 	if (text == "!hbot_help") {
+		GxLdBot.Chat(player, "**** hbot_dump = one-shot status+roles+actions+progress (console: scripted_user_func hbot_dump) ****");
 		GxLdBot.Chat(player, "!hbot_debug !hbot_debugfile !hbot_chat !hbot_mpguard !hbot_status !hbot_mode !hbot_profile !hbot_regen");
 		GxLdBot.Chat(player, "!hbot_mode player|escort|safe  console: hbot_mode_player / hbot_mode_escort");
-		GxLdBot.Chat(player, "!hbot_cvars !hbot_scout");
+		GxLdBot.Chat(player, "!hbot_cvars !hbot_scout !hbot_goof");
 		GxLdBot.Chat(player, "!hbot_actions !hbot_actions_toggle !hbot_rescue !hbot_retreat !hbot_cover !hbot_shove !hbot_assist");
 		GxLdBot.Chat(player, "!hbot_progress !hbot_progress_status !hbot_cards !hbot_reroll_cards !hbot_cards_toggle");
-		GxLdBot.Chat(player, "!hbot_roles !hbot_focus !hbot_claims");
+		GxLdBot.Chat(player, "!hbot_roles !hbot_focus !hbot_claims !hbot_dump");
 		return true;
 	}
 
@@ -1927,6 +1779,8 @@ function GxLdBot::RoundStart() {
 	GxLdBot.LastScout = {};
 	GxLdBot.LastScoutTarget = {};
 	GxLdBot.LastAttack = {};
+	GxLdBot.Goof = {};
+	GxLdBot.SpeedBots = {};
 	GxLdBot.Reviving = {};
 	GxLdBot.BeingRevived = {};
 	GxLdBot.ShoveCooldownUntil = {};

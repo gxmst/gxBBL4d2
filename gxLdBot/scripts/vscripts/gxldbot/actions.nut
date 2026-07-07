@@ -247,6 +247,120 @@ function GxLdBot::ClearHeal(bot) {
 	} catch (e) {}
 }
 
+// Release the forced crouch bit used by the goof-off teabag. Called whenever a
+// bot leaves idle (or any non-goof action) so the duck never sticks — a bot
+// left stuck crouched would be a visible, immersion-breaking bug.
+function GxLdBot::ClearGoof(bot) {
+	if (!GxLdBot.IsValidEntity(bot)) {
+		return;
+	}
+	try {
+		local b = NetProps.GetPropInt(bot, "m_afButtonForced");
+		if ((b & GxLdBot.BTN_DUCK) != 0) {
+			NetProps.SetPropInt(bot, "m_afButtonForced", b & ~GxLdBot.BTN_DUCK);
+		}
+	} catch (e) {}
+}
+
+// DESIGN 6.3 goof-off: zero-physical-risk idle antics. When a bot is idling in a
+// calm stall right next to the human with nothing else to do, it occasionally
+// teabags (toggles the crouch bit) and keeps facing the human — the classic
+// "bored teammate" tell. No shove (griefing risk), no movement change, no
+// flashlight yet (that needs a verified NetProp). Purely visual; cannot pull the
+// bot off the group or interrupt anyone. Returns true while an antic is running.
+function GxLdBot::GoofTick(bot, idx, human, now, maxDist = null) {
+	if (!GxLdBot.Settings.EnableGoof || !GxLdBot.IsValidEntity(bot)) {
+		return false;
+	}
+	// Only goof close to the human — a teabag nobody can see isn't worth it, and
+	// keeping it near the human guarantees we never drift into an outlier. The
+	// guide caller passes a wider maxDist (a scout holding its lead point is out
+	// ahead at mid-distance, so the default idle radius would bail every time).
+	if (human == null || !GxLdBot.IsValidEntity(human)) {
+		return false;
+	}
+	local radius = (maxDist != null) ? maxDist : GxLdBot.Settings.GoofHumanRadius;
+	if (GxLdBot.DistanceBetween(bot, human) > radius) {
+		return false;
+	}
+
+	local g = (idx in GxLdBot.Goof) ? GxLdBot.Goof[idx] : null;
+	if (g == null) {
+		// First antic fires SOON after a bot settles into idle (0.5-2s), not after
+		// the full 5-12s interval - otherwise idle rarely lasts long enough to ever
+		// see a teabag (that was the "never see bots crouch" bug). Subsequent antics
+		// use the normal Goof interval. A small per-bot random keeps them from all
+		// firing on the exact same tick.
+		g = { nextAt = now + GxLdBot.RandFloat(0.5, 2.0),
+			until = 0.0, lastToggle = 0.0, ducked = false };
+		GxLdBot.SetTableSlot(GxLdBot.Goof, idx, g);
+		return false;
+	}
+
+	// Currently mid-antic: drive the teabag toggle until it expires.
+	if (now < g.until) {
+		if ((now - g.lastToggle) >= GxLdBot.Settings.GoofCrouchToggle) {
+			g.lastToggle = now;
+			try {
+				local b = NetProps.GetPropInt(bot, "m_afButtonForced");
+				g.ducked = ((b & GxLdBot.BTN_DUCK) == 0);
+				if (g.ducked) {
+					NetProps.SetPropInt(bot, "m_afButtonForced", b | GxLdBot.BTN_DUCK);
+				} else {
+					NetProps.SetPropInt(bot, "m_afButtonForced", b & ~GxLdBot.BTN_DUCK);
+				}
+			} catch (e) {}
+		}
+		GxLdBot.FaceEntity(bot, human);
+		return true;
+	}
+
+	// Antic finished: make sure the duck bit is released, then roll for the next.
+	if (g.ducked) {
+		GxLdBot.ClearGoof(bot);
+		g.ducked = false;
+	}
+
+	// Shared team state gates when the squad may teabag as a group (DESIGN 10 #3).
+	local team = ("GoofTeam" in GxLdBot) ? GxLdBot.GoofTeam : null;
+
+	// JOIN-IN: if another bot just started an antic and we're inside the join
+	// window, roll to teabag along with them — this is the "a couple bots do it
+	// together" the player wanted. Join is NOT gated by the team cooldown (that's
+	// what lets them sync); the cooldown only gates fresh group starts below.
+	if (team != null && now < team.joinUntil &&
+			GxLdBot.RandInt(1, 100) <= GxLdBot.Settings.GoofJoinChance) {
+		g.until = now + GxLdBot.Settings.GoofDuration;
+		g.lastToggle = 0.0;
+		g.nextAt = now + GxLdBot.RandFloat(GxLdBot.Settings.GoofMinInterval,
+			GxLdBot.Settings.GoofMaxInterval);
+		GxLdBot.FaceEntity(bot, human);
+		return true;
+	}
+
+	if (now >= g.nextAt) {
+		g.nextAt = now + GxLdBot.RandFloat(GxLdBot.Settings.GoofMinInterval,
+			GxLdBot.Settings.GoofMaxInterval);
+		if (GxLdBot.RandInt(1, 100) <= GxLdBot.Settings.GoofChance) {
+			// Fresh group start — gated by the team-wide cooldown so the whole
+			// squad can't teabag constantly. Opening a start also opens the join
+			// window so others can pile on for the next GoofJoinWindow seconds.
+			if (team != null && (now - team.lastStart) < GxLdBot.Settings.GoofTeamCooldown) {
+				return false; // squad on cooldown — skip this start, try again later
+			}
+			if (team != null) {
+				team.lastStart = now;
+				team.joinUntil = now + GxLdBot.Settings.GoofJoinWindow;
+			}
+			g.until = now + GxLdBot.Settings.GoofDuration;
+			g.lastToggle = 0.0;
+			GxLdBot.FaceEntity(bot, human);
+			return true;
+		}
+	}
+	return false;
+}
+
 function GxLdBot::CountCommonsAround(origin, radius) {
 	local count = 0;
 	try {
@@ -293,6 +407,7 @@ function GxLdBot::CombatShoveTargetFor(bot, idx, now) {
 	local origin = null;
 	try { origin = bot.GetOrigin(); } catch (e) { return null; }
 
+	local originZ = origin.z;
 	try {
 		local p = null;
 		local best = null;
@@ -300,6 +415,16 @@ function GxLdBot::CombatShoveTargetFor(bot, idx, now) {
 		while (p = Entities.FindByClassnameWithin(p, "player", origin,
 				GxLdBot.Settings.CombatShoveSpecialRadius)) {
 			if (NetProps.GetPropInt(p, "m_iTeamNum") == 3 && !p.IsDead()) {
+				// Same-floor only: a special one floor up can't be shoved from here.
+				if (!GxLdBot.IsSameFloor(originZ, p)) {
+					continue;
+				}
+				// Never shove a Tank: shove does nothing to it (can't be staggered by
+				// melee), so a bot flailing shove at a Tank is the "useless shoving near
+				// the Tank" bug. Leave the Tank to gunfire (vanilla / assist).
+				if (("IsTank" in GxLdBot) && GxLdBot.IsTank(p)) {
+					continue;
+				}
 				local d = (p.GetOrigin() - origin).Length();
 				if (d < bestDist) {
 					best = p;
@@ -312,7 +437,14 @@ function GxLdBot::CombatShoveTargetFor(bot, idx, now) {
 		}
 	} catch (e2) {}
 
-	return GxLdBot.NearestCommonAround(origin, GxLdBot.Settings.CombatShoveRadius);
+	// Commons: only shove when actually swarmed by REACHABLE commons. A lone common
+	// is shot (vanilla), not shoved. Same-floor filtering is THE fix for "bot shoves
+	// empty air" — the sphere test used to count zombies a floor above/below.
+	local commons = GxLdBot.CountReachableCommons(origin, GxLdBot.Settings.CombatShoveRadius);
+	if (commons < GxLdBot.Settings.CombatShoveCommonCount) {
+		return null;
+	}
+	return GxLdBot.NearestReachableCommon(origin, GxLdBot.Settings.CombatShoveRadius);
 }
 
 function GxLdBot::ReviverFor(victim) {
@@ -336,6 +468,11 @@ function GxLdBot::IsUncommandable(bot) {
 	try { if (bot.IsIncapacitated()) return true; } catch (e1) {}
 	try { if (bot.IsHangingFromLedge()) return true; } catch (e2) {}
 	try { if (bot.IsStaggering()) return true; } catch (e3) {}
+	// On a ladder (movetype 9 = MOVETYPE_LADDER): NEVER command. Issuing BotMoveTo
+	// mid-climb interrupts the engine's ladder traversal and the bot drops off
+	// partway up (the "climbs to the middle then falls" bug on vertical maps).
+	// Hand ladder climbing entirely to vanilla.
+	try { if (NetProps.GetPropInt(bot, "movetype") == 9) return true; } catch (e4) {}
 	if (GxLdBot.IsPlayerReviving(bot)) {
 		return true;
 	}
@@ -387,6 +524,8 @@ function GxLdBot::AssignRescues(now) {
 	if (!GxLdBot.Settings.EnableRescue) {
 		return;
 	}
+	local maxDist = ("RescueMaxDistance" in GxLdBot.Settings)
+		? GxLdBot.Settings.RescueMaxDistance : 2200.0;
 	GxLdBot.ForEachSurvivor(function(victim) {
 		if (!GxLdBot.IsAlive(victim)) {
 			return;
@@ -401,6 +540,12 @@ function GxLdBot::AssignRescues(now) {
 				return; // someone is already on it
 			}
 		}
+		// A human victim is worth crossing more of the map for than a bot victim
+		// (the whole point is "my friend got grabbed, someone come get me"). We bias
+		// the rescuer-selection score for a human so a slightly-further bot will
+		// still commit, but keep a hard distance cap either way so nobody sprints
+		// across the level into a fresh pin and gets picked off alone.
+		local victimIsHuman = !GxLdBot.IsBot(victim);
 		local best = null;
 		local bestScore = 999999.0;
 		GxLdBot.ForEachSurvivorBot(function(b) {
@@ -410,9 +555,16 @@ function GxLdBot::AssignRescues(now) {
 			if (GxLdBot.OwnsHighPriorityClaim(b, key)) {
 				return;
 			}
+			local dist = GxLdBot.DistanceBetween(b, victim);
+			if (dist > maxDist) {
+				return; // too far to reach safely — leave it to whoever's closer
+			}
 			local profile = GxLdBot.GetProfile(b);
 			local bias = (profile != null) ? profile.rescueBias : 80;
-			local score = GxLdBot.DistanceBetween(b, victim) - bias * 2.0;
+			local score = dist - bias * 2.0;
+			if (victimIsHuman) {
+				score -= 400.0; // human victims win ties / pull a slightly-further rescuer
+			}
 			if (score < bestScore) {
 				bestScore = score;
 				best = b;
@@ -616,6 +768,7 @@ function GxLdBot::AssistTargetFor(bot) {
 		return null;
 	}
 
+	local botZ = botOrigin.z;
 	local best = { ent = null, score = 999999.0 };
 	GxLdBot.ForEachSurvivor(function(s) {
 		if (!GxLdBot.IsAlive(s)) {
@@ -632,8 +785,13 @@ function GxLdBot::AssistTargetFor(bot) {
 			return;
 		}
 
-		local special = GxLdBot.NearestThreatNear(s, 0.0, assistRadius * 2.0);
-		if (special != null) {
+		// Special near the swarmed survivor. The radius is NOT doubled anymore
+		// (it used to be assistRadius*2 = up to 1080u, which pulled a bot off
+		// vanilla free-fire whenever any special existed halfway across the map).
+		// The special must also be on the bot's floor — no swinging at a Hunter a
+		// storey up (L4D2 sphere-test trap, see IsSameFloor).
+		local special = GxLdBot.NearestThreatNear(s, 0.0, assistRadius);
+		if (special != null && GxLdBot.IsSameFloor(botZ, special)) {
 			local spScore = 999999.0;
 			try {
 				spScore = (botOrigin - special.GetOrigin()).Length() - 160.0;
@@ -645,13 +803,16 @@ function GxLdBot::AssistTargetFor(bot) {
 			return;
 		}
 
-		local commons = GxLdBot.CountCommonsAround(origin, assistRadius);
+		// Commons: same-floor count only, so an unreachable horde one floor
+		// up/down never triggers an assist. A survivor must be genuinely swarmed
+		// (assistCount+) by reachable commons before we leave vanilla combat.
+		local commons = GxLdBot.CountReachableCommons(origin, assistRadius);
 		if (commons < assistCount) {
 			return;
 		}
 
-		local target = GxLdBot.NearestCommonAround(origin, assistRadius);
-		if (target == null) {
+		local target = GxLdBot.NearestReachableCommon(origin, assistRadius);
+		if (target == null || !GxLdBot.IsSameFloor(botZ, target)) {
 			return;
 		}
 
@@ -668,12 +829,46 @@ function GxLdBot::AssistTargetFor(bot) {
 	return best.ent;
 }
 
+// Is THIS bot itself under close attack (commons swarming it / a special right on
+// it, same floor)? Used to split "assist" into two cases: helping a DISTANT
+// teammate clear trash is a low-priority pressure action that yields while the
+// human is moving (so the bot travels with the player instead of farming), but a
+// bot defending ITSELF from a swarm must always be allowed to fight back — that
+// suppression was why a trailing bot got surrounded and "couldn't shoot back".
+function GxLdBot::AssistIsSelfDefense(bot) {
+	if (!GxLdBot.IsValidEntity(bot)) {
+		return false;
+	}
+	local origin = null;
+	try { origin = bot.GetOrigin(); } catch (e) { return false; }
+	local radius = GxLdBot.Settings.AssistCommonRadius;
+	if (radius > 260.0) {
+		radius = 260.0; // self-defense = genuinely close, not map-wide
+	}
+	// A special right on top of us always counts.
+	local special = GxLdBot.NearestThreatNear(bot, 0.0, radius);
+	if (special != null && GxLdBot.IsSameFloor(origin.z, special)) {
+		return true;
+	}
+	// Or a real swarm of reachable commons at close range.
+	local n = GxLdBot.CountReachableCommons(origin, radius);
+	return n >= GxLdBot.Settings.AssistSelfDefenseCount;
+}
+
 function GxLdBot::EmergencyDefendIntentFor(bot) {
 	if (!GxLdBot.IsValidEntity(bot) || !("HumanEmergencyVictim" in GxLdBot)) {
 		return null;
 	}
 	local victim = GxLdBot.HumanEmergencyVictim();
 	if (victim == null || !GxLdBot.IsAlive(victim)) {
+		return null;
+	}
+	// Perception delay (DESIGN 3, layer 2): a bot reacts to the emergency only once
+	// it has "noticed" — a per-bot, personality-scaled stagger (0.1..0.5s) off the
+	// emergency onset. This stops all bots snapping to the victim on the same tick
+	// (the tell-tale swarm-mind look); a jumpy bot turns fast, a calm one a beat
+	// later. Kept small so it reads as human hesitation, not negligence.
+	if (("PerceivesEmergency" in GxLdBot) && !GxLdBot.PerceivesEmergency(bot)) {
 		return null;
 	}
 	if (GxLdBot.DistanceBetween(bot, victim) > GxLdBot.Settings.EmergencyThreatRadius) {
@@ -716,12 +911,39 @@ function GxLdBot::EscortIntentFor(bot) {
 	if (threshold > GxLdBot.Settings.MaxSeparation) {
 		threshold = GxLdBot.Settings.MaxSeparation;
 	}
-	if (GxLdBot.DistanceBetween(bot, human) <= threshold) {
-		return null;
+
+	// Formation widening (DESIGN 6.1/6.2/§10-#4): escort is higher priority than
+	// progress, so a fixed MaxSeparation cap yanks a scout back to the human before
+	// progress can push it ahead — that's why point/flanker used to trail BEHIND the
+	// moving human instead of leading. A scout is allowed to range out to the
+	// SquadDispersionMax leash AT ALL TIMES (not just when the human is parked), so
+	// it can stay ahead as the human advances and hold the spearhead formation. The
+	// centroid backstop below is the real isolation guard, so widening the human-leash
+	// here can never strand an unsupportable outlier.
+	local now = GxLdBot.Now();
+	local isScout = ("IsScoutRole" in GxLdBot) && GxLdBot.IsScoutRole(profile);
+	if (isScout && GxLdBot.Settings.SquadDispersionMax > threshold) {
+		threshold = GxLdBot.Settings.SquadDispersionMax;
 	}
+
 	local pos = null;
 	try { pos = human.GetOrigin(); } catch (e) { return null; }
-	return { pos = pos, human = human };
+
+	// 回身 trigger A: too far from the human.
+	if (GxLdBot.DistanceBetween(bot, human) > threshold) {
+		return { pos = pos, human = human };
+	}
+
+	// 回身 trigger B (DESIGN 6.2/5.4): even when bot-to-human distance is fine, a
+	// bot that has become the unsupportable outlier from the squad centroid must
+	// come home. This catches the case the human leash misses — the human has run
+	// off and this bot is stranded far from EVERYONE, not just from the human.
+	if (("BotCentroidDispersion" in GxLdBot) &&
+			GxLdBot.BotCentroidDispersion(bot) > GxLdBot.Settings.SquadDispersionMax) {
+		return { pos = pos, human = human };
+	}
+
+	return null;
 }
 
 function GxLdBot::IdleWanderPos(bot, human) {
@@ -812,7 +1034,13 @@ function GxLdBot::ComputeIntent(bot, idx, now) {
 		return { kind = "escort", pos = escort.pos, human = escort.human };
 	}
 
-	// 8) close-horde assist: short attack bursts to help clear swarmed teammates
+	// 8) close-horde assist: short attack bursts to help clear swarmed teammates.
+	// GATE (player request "bots should walk WITH me, not peel off to farm zombies"):
+	// while the human is actively moving and it's not a real emergency, DON'T start a
+	// fresh assist â fall through to progress/guide/escort so the bot travels with the
+	// player. An assist burst already in progress still finishes (cutting it mid-swing
+	// looks worse than letting it end). When the human stops (or a teammate is truly
+	// swarmed/pinned), assist resumes normally.
 	if (GxLdBot.Settings.EnableAssist) {
 		if (idx in GxLdBot.Action && GxLdBot.Action[idx].kind == "assist") {
 			local a = GxLdBot.Action[idx];
@@ -820,9 +1048,20 @@ function GxLdBot::ComputeIntent(bot, idx, now) {
 				return { kind = "assist", target = a.target };
 			}
 		}
-		local assistTarget = GxLdBot.AssistTargetFor(bot);
-		if (assistTarget != null) {
-			return { kind = "assist", target = assistTarget };
+		// SELF-DEFENSE always wins: a bot swarmed/specialed at close range must be
+		// allowed to fight back even while the human is moving — suppressing that was
+		// why a trailing bot got surrounded and couldn't shoot back. Only a NON-self
+		// assist (peeling off to clear trash around a DISTANT teammate) yields to
+		// travel-with-the-human, and even that only while the human is actually moving
+		// and it isn't a real emergency.
+		local selfDefense = ("AssistIsSelfDefense" in GxLdBot) && GxLdBot.AssistIsSelfDefense(bot);
+		local humanMoving = ("HumanIsMoving" in GxLdBot) && GxLdBot.HumanIsMoving();
+		local emergency = ("TeamEmergency" in GxLdBot) && GxLdBot.TeamEmergency();
+		if (selfDefense || !humanMoving || emergency) {
+			local assistTarget = GxLdBot.AssistTargetFor(bot);
+			if (assistTarget != null) {
+				return { kind = "assist", target = assistTarget };
+			}
 		}
 	}
 
@@ -831,9 +1070,16 @@ function GxLdBot::ComputeIntent(bot, idx, now) {
 	// objective; the old human-relative scout is a fallback for maps with no
 	// usable flow (finales / survival).
 	if ("ProgressIntentFor" in GxLdBot) {
-		local ppos = GxLdBot.ProgressIntentFor(bot);
-		if (ppos != null) {
-			return { kind = "progress", pos = ppos };
+		local pres = GxLdBot.ProgressIntentFor(bot);
+		if (pres != null) {
+			// ProgressIntentFor returns either a bare Vector (walk toward it) or a
+			// { guide = true, human = ... } table (scout reached its lead point —
+			// hold ground and face the human, "this way, follow me"). Distinguish so
+			// we never feed the guide table to BotMoveTo as a position.
+			if (typeof pres == "table" && ("guide" in pres)) {
+				return { kind = "guide", human = pres.human };
+			}
+			return { kind = "progress", pos = pres };
 		}
 	}
 	local spos = GxLdBot.ScoutIntentFor(bot);
@@ -955,8 +1201,17 @@ function GxLdBot::EnactIntent(bot, idx, intent, now) {
 			a = { kind = "shove", since = now, until = now + duration,
 				ready = 0.0, target = intent.target, pos = null, movedAt = 0.0, holding = false, claimKey = null };
 			GxLdBot.SetTableSlot(GxLdBot.Action, idx, a);
-			GxLdBot.SetTableSlot(GxLdBot.ShoveCooldownUntil, idx,
-				now + duration + GxLdBot.Settings.CombatShoveCooldown);
+			// Global shove floor (DESIGN/user: "5s between shoves"). The old micro
+			// cooldown (0.38) let a bot re-shove almost every tick, which read as
+			// spammy air-shoving next to a Tank. We take the LARGER of the micro gap
+			// and the global floor. NOTE: this only gates COMBAT shove — rescue shove
+			// (breaking a pin off a teammate) is deliberately exempt and never reads
+			// ShoveCooldownUntil, so a rescue can still shove repeatedly to free you.
+			local micro = GxLdBot.Settings.CombatShoveCooldown;
+			local floor = ("ShoveGlobalCooldown" in GxLdBot.Settings)
+				? GxLdBot.Settings.ShoveGlobalCooldown : micro;
+			local gap = (micro > floor) ? micro : floor;
+			GxLdBot.SetTableSlot(GxLdBot.ShoveCooldownUntil, idx, now + duration + gap);
 		}
 		a.target = intent.target;
 		GxLdBot.ClearHeal(bot);
@@ -1119,6 +1374,59 @@ function GxLdBot::EnactIntent(bot, idx, intent, now) {
 		return;
 	}
 
+	// Guide-hold (player's "walk to a mid distance, then turn and look back at me
+	// to signal the way" — instead of creeping close and shuffling back and forth).
+	// The scout has reached its lead point; it stops (hand back to vanilla so it
+	// stands its ground) and faces the human. It is NOT moved anywhere, so escort
+	// can't yank it home and re-trigger the shuffle. When the human catches up their
+	// flow rises, the scout's target flow rises with it, and progress moves it
+	// forward again on the next tick — a natural "breadcrumb waits, then leads on".
+	if (intent.kind == "guide") {
+		local a = (idx in GxLdBot.Action) ? GxLdBot.Action[idx] : null;
+		if (a != null && a.kind != "guide") {
+			GxLdBot.EndAction(bot, idx, true);
+			a = null;
+		}
+		if (a == null) {
+			// Record the hold spot = where the scout arrived. We PIN it here by
+			// commanding move-to-self, NOT BotResetCommand — reset hands control to
+			// vanilla, which then walks the (ahead-of-team) bot back toward the human,
+			// dropping its flow so it re-triggers progress and creeps forward again:
+			// that back-and-forth is the "左右来回走" the player saw. Pinning stops it.
+			local holdPos = null;
+			try { holdPos = bot.GetOrigin(); } catch (e) {}
+			a = { kind = "guide", since = now, until = 0.0, ready = 0.0,
+				target = intent.human, pos = holdPos, movedAt = now, holding = true, claimKey = null };
+			GxLdBot.SetTableSlot(GxLdBot.Action, idx, a);
+			GxLdBot.Notify("action:guide:" + idx,
+				GxLdBot.SafeName(bot) + " leading the way", 12.0);
+		}
+		a.target = intent.human;
+		GxLdBot.ClearShove(bot);
+		// Keep the scout pinned at its hold spot. Re-command move-to-hold ONLY when it
+		// has actually drifted off (vanilla nudge / knockback) or periodically, NOT
+		// every tick — re-issuing a move order every 0.18s to the spot it's already on
+		// makes it micro-path and jitter (that's the "左右来回走" the player reported).
+		if (a.pos != null) {
+			local drift = 0.0;
+			try { drift = (bot.GetOrigin() - a.pos).Length(); } catch (e2) {}
+			if (drift > 80.0 || (now - a.movedAt) > 2.0) {
+				GxLdBot.BotMoveTo(bot, a.pos);
+				a.movedAt = now;
+			}
+		}
+		if (GxLdBot.IsValidEntity(intent.human)) {
+			// While holding as a guide, occasionally teabag at the human ("this way!")
+			// — this is the main place the player will actually SEE goofing, since a
+			// scout out front hits guide-hold far more often than the whole team goes
+			// idle. GoofTick owns crouch+facing during an antic; otherwise just face.
+			if (!GxLdBot.GoofTick(bot, idx, intent.human, now, GxLdBot.Settings.SquadDispersionMax)) {
+				GxLdBot.FaceEntity(bot, intent.human); // turn back toward the human: "this way"
+			}
+		}
+		return;
+	}
+
 	if (intent.kind == "progress") {
 		GxLdBot.IssueMoveIntent(bot, idx, "progress", intent.pos, null, now);
 		return;
@@ -1136,6 +1444,18 @@ function GxLdBot::EnactIntent(bot, idx, intent, now) {
 
 	if (intent.kind == "idle") {
 		local human = intent.human;
+		// Teabag FIRST: if an antic is running, the bot must STAND STILL so the
+		// crouch is actually visible. The old code always issued a wander move, so
+		// a bot "teabagged" while circling the human and you could never see it.
+		// Only wander when NOT mid-antic.
+		if (GxLdBot.GoofTick(bot, idx, human, now)) {
+			// Standing ground + crouching + facing the human (GoofTick faces).
+			if (idx in GxLdBot.Action && GxLdBot.Action[idx].kind != "idle") {
+				GxLdBot.EndAction(bot, idx, true);
+			}
+			GxLdBot.IdleSpeak(bot, human);
+			return;
+		}
 		local pos = null;
 		pos = GxLdBot.IdleWanderPos(bot, human);
 		if (pos == null) {
@@ -1168,6 +1488,7 @@ function GxLdBot::EndAction(bot, idx, doReset) {
 	}
 	GxLdBot.ClearShove(bot);
 	GxLdBot.ClearHeal(bot);
+	GxLdBot.ClearGoof(bot);
 	if (doReset) {
 		GxLdBot.BotResetCommand(bot);
 	}
@@ -1189,6 +1510,7 @@ function GxLdBot::ClearAllActions(doReset) {
 	GxLdBot.ForEachSurvivorBot(function(b) {
 		GxLdBot.ClearShove(b);
 		GxLdBot.ClearHeal(b);
+		GxLdBot.ClearGoof(b);
 	});
 }
 

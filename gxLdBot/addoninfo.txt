@@ -2,8 +2,8 @@
 {
 	addonSteamAppID		550
 	addontitle		"Buddy Bots for L4D2"
-	addonversion		"0.7.1-strength"
+	addonversion		"1.0"
 	addonauthor		"gxLdBot contributors"
-	addonDescription	"VScript prototype for player-like survivor bots: stronger buddy mode, old escort mode toggle, self-heal commitment fix, frequent close-threat shoves, bot cards, flow-based advancement, action arbitration, and debug output."
+	addonDescription	"VScript addon for player-like survivor bots: buddy/escort/safe modes, per-bot roles and roguelike cards, flow-based map advancement with a scout guide formation, rubber-band catch-up, action arbitration (rescue/defend/assist/retreat/cover), emergency defense, and debug output."
 	addonContent_Script	1
 }

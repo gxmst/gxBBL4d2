@@ -10,12 +10,12 @@ Buddy Bots for L4D2.
 
 ## Status
 
-Current version: `0.7.1-strength`
+Current version: `1.0`
 
-This is experimental. It is built for single-player and local bot testing first.
-It does not replace the Source engine survivor AI. It nudges vanilla bot
-behavior through VScript, cvars, event callbacks, `CommandABot`, and guarded
-NetProps usage.
+This is the first stable release. It is built for single-player and local bot
+testing first. It does not replace the Source engine survivor AI. It nudges
+vanilla bot behavior through VScript, cvars, event callbacks, `CommandABot`, and
+guarded NetProps usage.
 
 ## Design Goal
 
@@ -35,16 +35,29 @@ Rule of thumb: randomize timing and style, not basic survival responsibility.
 - Player-like default behavior mode with wider-but-bounded forward pressure.
 - Old escort-style mode for the previous tighter, human-centered behavior.
 - Conservative safe mode for debugging.
-- Per-bot roles: point, flanker, follower, anchor.
-- Per-bot personality profiles and roguelike-style bot cards.
-- Flow-based map advancement using nav flow when available.
+- Per-bot roles forming a two-group formation: point + flanker scout ahead,
+  anchor/follower stay back as the rear guard.
+- Flow-based map advancement using nav-mesh flow gradient ascent when available.
+  A lead scout that reaches its point holds ground and turns to face you ("this
+  way") instead of shuffling back and forth.
+- Rubber-band movement: a bot that falls far behind the squad speeds up to
+  rejoin instead of trailing and getting surrounded.
+- Per-bot personality profiles and roguelike bot cards with rarity tiers
+  (common / rare / legendary), including movespeed cards. No two teammates draw
+  the same card.
 - Single action arbiter for move, attack, shove, retreat, cover, assist,
-  progress, scout, idle, and optional scripted rescue actions.
-- Emergency defense for pinned or incapacitated humans.
+  progress, scout, guide, idle, and optional scripted rescue actions.
+- Assist is suppressed while you are moving (bots travel with you instead of
+  farming trash), but a bot always fights back when swarmed itself.
+- Emergency defense for pinned or incapacitated humans, with a small
+  personality-scaled reaction delay so bots do not all snap in unison.
+- Ladder-aware: bots hand full control back to the engine while climbing, so
+  they no longer fall off mid-climb.
+- Guns-only combat tuning (no melee weapons) with crisper aim tracking.
 - Callouts for pins, Tank/Witch spawns, downs, and heal intent.
 - Multiplayer guard that sleeps and restores cvars when more than one human is
   detected.
-- Chat and console debug commands.
+- Chat and console debug commands, including a one-shot `hbot_dump`.
 
 ## Behavior Modes
 
@@ -100,9 +113,10 @@ Chat commands work in a local/scripted game:
 !hbot_assist
 ```
 
-From the console, use `scripted_user_func`:
+From the console, use `scripted_user_func` (no `sv_cheats` needed):
 
 ```text
+scripted_user_func hbot_dump
 scripted_user_func hbot_status
 scripted_user_func hbot_mode_player
 scripted_user_func hbot_mode_escort
@@ -111,6 +125,9 @@ scripted_user_func hbot_actions
 scripted_user_func hbot_progress_status
 scripted_user_func hbot_cards
 ```
+
+`hbot_dump` is the handiest one: it prints status, per-bot roles, current
+actions, and flow/lead progress in a single report.
 
 Typing `!hbot_status` directly at the `]` console prompt is expected to fail;
 that prompt only runs Source console commands.
@@ -155,9 +172,10 @@ Then restart L4D2 or reload the map.
 
 1. Disable other script addons that also ship `director_base_addon.nut`.
 2. Start a local map, for example `c1m1_hotel`.
-3. Run `scripted_user_func hbot_status`.
-4. Expected status includes `v0.7.1-strength`, `mode=player`, `cards=true`,
-   `progress=true`, `actions=true`, and `rescue=false`.
+3. Run `scripted_user_func hbot_dump` for a one-shot report of status, roles,
+   actions, and progress.
+4. Expected status includes `v1.0`, `mode=player`, `cards=true`,
+   `progress=true`, `actions=true`, and `rescue=true`.
 5. Run `scripted_user_func hbot_mode_escort` to confirm old-style mode switching.
 
 ## Repository Layout
@@ -165,6 +183,8 @@ Then restart L4D2 or reload the map.
 ```text
 gxLdBot/
   addoninfo.txt
+  DESIGN.md
+  README.md
   scripts/vscripts/director_base_addon.nut
   scripts/vscripts/gxldbot/*.nut
 build-vpk.ps1
@@ -172,8 +192,9 @@ requirements.md
 bot-ai-comparison.md
 ```
 
-`gxLdBot/README.md` is the longer development notebook. The root README is the
-public-facing project overview.
+`gxLdBot/DESIGN.md` is the authoritative design/architecture document (moved in
+with the addon so it ships alongside the source). `gxLdBot/README.md` is the
+longer development notebook. The root README is the public-facing overview.
 
 ## Known Limits
 

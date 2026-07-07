@@ -2,21 +2,21 @@
 
 [English README](README.md)
 
-Buddy Bots for L4D2 是一个 Left 4 Dead 2 的 VScript 模组原型，目标是让生还者 bot 更像“会一起打的队友”，而不是只会贴着玩家走的护航单位。
+Buddy Bots for L4D2 是一个 Left 4 Dead 2 的 VScript 模组，目标是让生还者 bot 更像“会一起打的队友”，而不是只会贴着玩家走的护航单位。
 
 内部脚本命名仍然保留 `gxLdBot`，对外项目名使用 Buddy Bots for L4D2。
 
 ## 当前状态
 
-当前版本：`0.7.1-strength`
+当前版本：`1.0`
 
-这是实验性项目，优先面向单人 / 本地 bot 测试。它不会替换 Source 引擎底层的生还者 AI，而是在原版 bot 之上，通过 VScript、cvar、事件回调、`CommandABot` 和带保护的 NetProps 操作去做行为引导。
+首个正式版，优先面向单人 / 本地 bot 测试。它不会替换 Source 引擎底层的生还者 AI，而是在原版 bot 之上，通过 VScript、cvar、事件回调、`CommandABot` 和带保护的 NetProps 操作去做行为引导。
 
 ## 设计目标
 
 目标不是“不惜一切代价让 bot 更强”，而是让 bot 更像另一个玩家：
 
-- 安全时会自己往路线前方推进一点；
+- 安全时会自己往路线前方推进带路；
 - 队伍卡住时会表现出一点不耐烦和主动性；
 - 每个 bot 有角色、性格和卡牌差异；
 - 一旦有人被控、倒地或队伍承压，立刻回到救援和防守优先级。
@@ -29,13 +29,16 @@ Buddy Bots for L4D2 是一个 Left 4 Dead 2 的 VScript 模组原型，目标是
 - `escort` 旧版护航模式，可切回 0.6.3 风格。
 - `safe` 保守调试模式。
 - bot 角色：point、flanker、follower、anchor。
-- 每个 bot 有性格档案和 roguelike 风格卡牌。
-- 可用地图 nav flow 时，bot 会基于流程距离主动推进。
-- 单一动作仲裁器，统一处理移动、攻击、右键推、撤退、掩护、协助、推进、侦察、idle 和可选脚本救援。
-- 人类玩家被控或倒地时，触发紧急防守。
+- **双组阵型**：point + flanker 作为前锋在前方带路探路，anchor 殿后贴人保护。
+- **flow 梯度带路**：可用地图 nav flow 时，前锋沿流程距离往前带路；到位后停下并转身面向玩家示意“这边走”。
+- **橡皮筋移速**：离队伍越远的 bot 移动越快，掉队的能自己追回队伍，避免吊尾被围。
+- 每个 bot 有性格档案和 roguelike 风格卡牌（分普通 / 稀有 / 传说稀有度），含移速卡（Ranger / Sprinter）。
+- 单一动作仲裁器，统一处理移动、攻击、右键推、撤退、掩护、协助、推进、侦察、idle 和脚本救援。
+- 人类玩家被控或倒地时触发紧急防守；4 个 bot 按性格错开反应，不会同帧齐扑。
+- 玩家移动时 bot 优先跟队同行，不会为清杂兵掉队；但自身被围时始终会还手自卫。
 - 特感控制、Tank/Witch、倒地、治疗意图等事件有语音 / 调试提示。
 - 多人保护：检测到超过一名人类玩家时休眠并恢复 cvar。
-- 聊天和控制台调试命令。
+- 聊天和控制台调试命令，含一条聚合状态命令 `hbot_dump`。
 
 ## 行为模式
 
@@ -70,12 +73,14 @@ scripted_user_func hbot_mode_safe
 ```text
 !hbot_help
 !hbot_status
+!hbot_dump
 !hbot_mode
 !hbot_profile
 !hbot_roles
 !hbot_actions
 !hbot_progress_status
 !hbot_cards
+!hbot_reroll_cards
 !hbot_debug
 !hbot_debugfile
 !hbot_chat
@@ -91,9 +96,10 @@ scripted_user_func hbot_mode_safe
 !hbot_assist
 ```
 
-控制台请使用 `scripted_user_func`：
+控制台请使用 `scripted_user_func`（无需开启 sv_cheats）：
 
 ```text
+scripted_user_func hbot_dump
 scripted_user_func hbot_status
 scripted_user_func hbot_mode_player
 scripted_user_func hbot_mode_escort
@@ -103,7 +109,9 @@ scripted_user_func hbot_progress_status
 scripted_user_func hbot_cards
 ```
 
-直接在 `]` 控制台输入 `!hbot_status` 报未知命令是正常的；那个位置只能运行 Source 控制台命令。
+`hbot_dump` 一条命令输出全部状态（版本 / 模式 / 各开关 / 每个 bot 的角色 / 当前动作 / flow 进度），调试时最方便。
+
+直接在 `]` 控制台输入 `!hbot_status` 报未知命令是正常的；那个位置只能运行 Source 控制台命令，聊天命令请按 Y 在聊天框输入。
 
 ## 打包
 
@@ -144,8 +152,8 @@ Left 4 Dead 2/left4dead2/addons/gxldbot.vpk
 
 1. 关闭其他也包含 `director_base_addon.nut` 的脚本 addon。
 2. 开一个本地地图，例如 `c1m1_hotel`。
-3. 运行 `scripted_user_func hbot_status`。
-4. 预期输出包含 `v0.7.1-strength`、`mode=player`、`cards=true`、`progress=true`、`actions=true`、`rescue=false`。
+3. 运行 `scripted_user_func hbot_dump`。
+4. 预期输出包含 `v1.0`、`mode=player`、`cards=true`、`progress=true`、`actions=true`、`rescue=true`。
 5. 运行 `scripted_user_func hbot_mode_escort`，确认可以切回旧护航风格。
 
 ## 仓库结构
@@ -153,20 +161,23 @@ Left 4 Dead 2/left4dead2/addons/gxldbot.vpk
 ```text
 gxLdBot/
   addoninfo.txt
+  DESIGN.md                          设计文档（权威规划）
+  README.md                          较长的开发记录
   scripts/vscripts/director_base_addon.nut
-  scripts/vscripts/gxldbot/*.nut
+  scripts/vscripts/gxldbot/*.nut     main / actions / progress / cards / survival / social / squad / config
 build-vpk.ps1
+README.md / README.zh-CN.md          公开入口说明
 requirements.md
 bot-ai-comparison.md
 ```
 
-`gxLdBot/README.md` 是更长的开发记录。根目录 README 是公开仓库入口说明。
+`gxLdBot/DESIGN.md` 是权威设计文档，改代码前先读。`gxLdBot/README.md` 是更长的开发记录。根目录 README 是公开仓库入口说明。
 
 ## 已知限制
 
 - 瞄准和移动底层仍由游戏引擎控制。
-- 基于 flow 的推进依赖地图 / nav flow 是否可用。
-- 脚本救援已实现，但默认关闭；原版救援通常更稳。
+- 基于 flow 的推进依赖地图 / nav flow 是否可用；在垂直 / 山洞型、梯子密集的第三方图（如 fallen），flow 带路方向感会变弱——这是 flow 机制本身的天花板。
+- 脚本救援默认开启（human 优先、有距离上限）；如需回到纯原版救援可用 `!hbot_rescue` 关闭。
 - 物品拾取、投掷物经济、武器切换、完整战斗接管不是当前版本重点。
 - 多人保护能降低风险，但加载屏阶段的 addon 冲突可能发生在 VScript 运行之前。
 

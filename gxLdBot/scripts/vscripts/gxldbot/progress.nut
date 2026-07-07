@@ -91,10 +91,12 @@ function GxLdBot::LeadFlowFor(profile) {
 	return lead;
 }
 
-// Search nav areas around the bot and return the center of the one that best
-// advances flow toward targetFlow without overshooting the lead cap. Returns a
-// Vector or null. Bounded by ProgressMaxAreas so the scan stays cheap.
-function GxLdBot::BestForwardArea(bot, botFlow, targetFlow) {
+// FALLBACK: the original radius scan. Kept as a fail-safe for maps where nav
+// adjacency is unavailable (GetAdjacentAreas returns nothing).撒网扫描: query
+// every nav area within ProgressScanRadius and pick the best forward one. This is
+// the expensive path (up to ProgressMaxAreas flow lookups) that the gradient
+// walker below replaces on maps where adjacency works.
+function GxLdBot::BestForwardAreaScan(bot, botFlow, targetFlow) {
 	local origin = null;
 	try { origin = bot.GetOrigin(); } catch (e) { return null; }
 
@@ -154,6 +156,127 @@ function GxLdBot::BestForwardArea(bot, botFlow, targetFlow) {
 	return best;
 }
 
+// Collect all nav areas adjacent to `area` across all 4 directions into `out`
+// (keyed by area, value = the area). GetAdjacentAreas(dir, table) takes a
+// direction enum 0..3 (verified in-game via hbot_navprobe: dir 0..3 each return
+// neighbors). Returns the count found.
+function GxLdBot::CollectAdjacent(area, out) {
+	local count = 0;
+	for (local dir = 0; dir < 4; dir++) {
+		local adj = {};
+		try {
+			area.GetAdjacentAreas(dir, adj);
+		} catch (e) {
+			continue;
+		}
+		foreach (k, a in adj) {
+			if (a == null) { continue; }
+			// Key by integer area ID, NOT the area instance: Squirrel table keys on
+			// native instance handles are not reliable for identity/dedup (the ref
+			// mod always uses GetID()). Value stays the area so callers can use it.
+			local aid = null;
+			try { aid = a.GetID(); } catch (eid) { continue; }
+			if (aid != null && !(aid in out)) {
+				out[aid] <- a;
+				count++;
+			}
+		}
+	}
+	return count;
+}
+
+// GRADIENT ASCENT (layer-2, verified viable via hbot_navprobe: +106 flow to an
+// adjacent area). Instead of scanning every nav area in a big radius (~96 flow
+// lookups), walk the nav graph from the bot's current area toward higher flow one
+// hop at a time, up to ProgressGradientSteps hops. Each hop only inspects a
+// handful of neighbors (~5), so this is roughly an order of magnitude cheaper than
+// BestForwardAreaScan — THE fix for the progress PERF spikes. Returns the center
+// of the furthest area we climbed to (still under the targetFlow ceiling), or null
+// to signal "fall back to the radius scan" when adjacency is unavailable.
+function GxLdBot::BestForwardArea(bot, botFlow, targetFlow) {
+	local startArea = null;
+	try { startArea = bot.GetLastKnownArea(); } catch (e) {}
+	if (startArea == null) {
+		// No area handle — can't gradient-walk; let the caller use the scan.
+		return GxLdBot.BestForwardAreaScan(bot, botFlow, targetFlow);
+	}
+
+	local minGain = GxLdBot.Settings.ProgressMinAdvanceFlow;
+	local maxSteps = ("ProgressGradientSteps" in GxLdBot.Settings)
+		? GxLdBot.Settings.ProgressGradientSteps : 4;
+
+	local current = startArea;
+	local currentFlow = botFlow;
+	local best = null;        // furthest acceptable spot found so far
+	// visited is keyed by area GetID() (integer) — NOT the area instance. Native
+	// instance handles are not reliable table keys in Squirrel (the reference mod
+	// always keys nav areas by GetID), so we do the same to avoid a silent
+	// dedup-failure that could loop the walk.
+	local visited = {};
+	try { visited[current.GetID()] <- true; } catch (e) {}
+	local hopsFound = 0;
+
+	for (local step = 0; step < maxSteps; step++) {
+		local neighbors = {};
+		local n = GxLdBot.CollectAdjacent(current, neighbors);
+		if (n <= 0) {
+			break; // no adjacency from here
+		}
+
+		// Pick the neighbor with the highest flow that does NOT overshoot our lead
+		// ceiling and is genuinely forward. This is the ascent step.
+		local bestNext = null;
+		local bestNextFlow = currentFlow;
+		local bestNextSpot = null;
+		local bestNextId = -1;
+		foreach (k, a in neighbors) {
+			// k is the neighbor's GetID() (CollectAdjacent keys by ID).
+			if (k in visited) { continue; }
+			try {
+				if (("IsBlocked" in a) && (a.IsBlocked(2, false) || a.IsBlocked(2, true))) {
+					continue;
+				}
+			} catch (eb) {}
+			local spot = null;
+			try { spot = a.GetCenter(); } catch (ec) { continue; }
+			if (spot == null) { continue; }
+			local f = GxLdBot.GetFlowFor(spot);
+			if (f == null) { continue; }
+			if (f > targetFlow + 60.0) {
+				continue; // past our allowed lead — don't climb toward the exit
+			}
+			if (f > bestNextFlow) {
+				bestNextFlow = f;
+				bestNext = a;
+				bestNextSpot = spot;
+				bestNextId = k;
+			}
+		}
+
+		if (bestNext == null) {
+			break; // no higher-flow neighbor under the ceiling — stop climbing
+		}
+
+		// Accept this hop.
+		visited[bestNextId] <- true;
+		current = bestNext;
+		currentFlow = bestNextFlow;
+		hopsFound++;
+		// Only treat it as a usable target once it's meaningfully ahead of the bot.
+		if (bestNextFlow > botFlow + minGain) {
+			best = bestNextSpot;
+		}
+	}
+
+	// If the gradient walk produced nothing usable (e.g. adjacency worked but every
+	// neighbor was blocked/backward), fall back to the radius scan so we never
+	// silently stop leading on an odd map.
+	if (best == null && hopsFound == 0) {
+		return GxLdBot.BestForwardAreaScan(bot, botFlow, targetFlow);
+	}
+	return best;
+}
+
 // Decision only: the world position this bot should advance toward to push the
 // map forward, or null to leave it to vanilla (follow / fight). The arbiter
 // enacts the move under the "progress" intent slot. Throttled per bot so the flow
@@ -196,17 +319,71 @@ function GxLdBot::ProgressIntentFor(bot) {
 	local baseFlow = (humanFlow != null) ? humanFlow : botFlow;
 	local targetFlow = baseFlow + GxLdBot.LeadFlowFor(profile);
 	local now = GxLdBot.Now();
-	if (hasHuman && (now - GxLdBot.LastTeamMoveTime) >= GxLdBot.Settings.ActiveAdvanceDelay) {
+
+	// Only forward-pressure roles (point/flanker) probe ahead of a parked human;
+	// anchor/follower stay tethered so we never pull an unsupportable bot off the
+	// front (DESIGN 6.1 / 5.4 防孤立).
+	local isScout = ("IsScoutRole" in GxLdBot) && GxLdBot.IsScoutRole(profile);
+
+	// PROACTIVE LEAD + SCOUT FORMATION (player's "I get lost on third-party maps, I
+	// want a bot walking ahead as a guide, not waiting for me to point the way").
+	// A scout carries a constant forward lead so it stays ahead as a living
+	// breadcrumb even while you creep along. We split it by role to build a depth
+	// formation: the POINT bot is the tip-of-spear guide (full ScoutLeadFlow, walks
+	// furthest ahead — follow it and you're going the right way, flow always climbs
+	// toward the exit); the FLANKER is a mid relay (a fraction of it) so it bridges
+	// between you and the point instead of both bunching at the same distance.
+	// Anchor/follower get nothing — they stay tethered as the rear guard (防孤立铁律).
+	if (isScout) {
+		local roleLead = GxLdBot.Settings.ScoutLeadFlow;
+		if (profile.role == "flanker") {
+			local mul = ("ScoutFlankerLeadMul" in GxLdBot.Settings)
+				? GxLdBot.Settings.ScoutFlankerLeadMul : 0.5;
+			roleLead = roleLead * mul;
+		}
+		targetFlow += roleLead;
+	}
+
+	// Stall probe — THE §6.1 fix. When the human has been parked past
+	// ActiveAdvanceDelay, a scout pushes FURTHER to peek ahead. The old code added
+	// ActiveAdvanceFlowBoost but then let a fixed ProgressMaxLeadFlow ceiling slap
+	// it straight back; we RAISE the ceiling by StallProbeExtraFlow while stalled,
+	// scout-only, so bots actually reach ahead instead of clamping to human flow.
+	local stalled = hasHuman && (now - GxLdBot.LastTeamMoveTime) >= GxLdBot.Settings.ActiveAdvanceDelay;
+	if (stalled && isScout) {
 		targetFlow += GxLdBot.Settings.ActiveAdvanceFlowBoost;
-		local maxTarget = baseFlow + GxLdBot.Settings.ProgressMaxLeadFlow;
+	}
+	// Cap: scouts may lead out to the raised ceiling; the centroid/dispersion
+	// backstop below is the real isolation guard, so a generous flow cap is safe.
+	if (isScout) {
+		local maxTarget = baseFlow + GxLdBot.Settings.ProgressMaxLeadFlow +
+			GxLdBot.Settings.StallProbeExtraFlow;
 		if (targetFlow > maxTarget) {
 			targetFlow = maxTarget;
 		}
 	}
 
-	// Already at/past our allowed lead: hold and let vanilla escort pull us back
-	// toward the team instead of pushing further forward.
+	// Already at/past our allowed lead. If we're a scout who has genuinely walked
+	// AHEAD of the human (leading), don't hand back to vanilla — vanilla's follow
+	// then walks us straight back to the human, which is the "来回蹭" shuffle the
+	// player complained about. Instead return a GUIDE-HOLD: stop here and face the
+	// human ("walked ahead, now I turn and wait / point the way"). Only when it's
+	// safe (no combat, not isolated); otherwise fall through to vanilla as before.
 	if (botFlow >= targetFlow - GxLdBot.Settings.ProgressFlowTolerance) {
+		if (isScout && human != null && humanFlow != null && humanFlow < botFlow
+				&& GxLdBot.BotCentroidDispersion(bot) <= GxLdBot.Settings.SquadDispersionMax
+				&& !(("ScoutCombatNearby" in GxLdBot) && GxLdBot.ScoutCombatNearby(bot, human))) {
+			return { guide = true, human = human };
+		}
+		return null;
+	}
+
+	// Isolation backstop (DESIGN 5.4 / 6.2): if this bot is already the outlier
+	// (furthest from the squad centroid beyond SquadDispersionMax), never push it
+	// further forward — escort's 回身 check will pull it home instead. This catches
+	// "far from EVERYONE and unsupportable," which the bot-to-human leash misses
+	// when the human themselves has run off.
+	if (GxLdBot.BotCentroidDispersion(bot) > GxLdBot.Settings.SquadDispersionMax) {
 		return null;
 	}
 
@@ -220,7 +397,19 @@ function GxLdBot::ProgressIntentFor(bot) {
 		if (maxSep < 300.0) {
 			maxSep = 300.0;
 		}
+		// During a stall probe a scout is allowed to range further from the human
+		// (that's the point — go look ahead). The bot-to-human leash widens up to
+		// SquadDispersionMax; the centroid backstop above is the real isolation
+		// guard, so widening here can't create an unsupportable outlier.
+		// A SCOUT is allowed to range out to the guide distance at ALL times (not
+		// just during a stall), so it can walk ahead as a breadcrumb while you move
+		// too — without escort yanking it back at MaxSeparation (that yank was the
+		// "creep forward / get pulled back" shuffle). The centroid backstop above is
+		// the real isolation guard, so widening the human leash here is safe.
 		local hardCap = GxLdBot.Settings.MaxSeparation + 120.0;
+		if (isScout && GxLdBot.Settings.SquadDispersionMax > hardCap) {
+			hardCap = GxLdBot.Settings.SquadDispersionMax;
+		}
 		if (maxSep > hardCap) {
 			maxSep = hardCap;
 		}
@@ -294,4 +483,100 @@ function GxLdBot::PrintProgress(player) {
 	if (!GxLdBot.Settings.EnableProgress) {
 		GxLdBot.Chat(player, "progress is OFF (!hbot_progress to enable)");
 	}
+}
+
+// ---- LAYER-2 NAV-API PROBE (read-only diagnostic, DESIGN perf roadmap) ------
+//
+// Verifies whether the flow-gradient-ascent APIs work in THIS sandbox before we
+// rewrite BestForwardArea to use them. Rewrites nothing; just runs each API on a
+// real survivor bot and reports what succeeded, so we learn in ONE game launch
+// whether "walk the adjacency graph up-flow" (cheap) can replace "scan all nav
+// areas in a big radius" (the 7-12ms cost). Chat-only output.
+//
+// The four things we must confirm:
+//   1. GetLastKnownArea() returns a usable area on a bot
+//   2. area.GetID()/GetCenter() work
+//   3. area.GetAdjacentAreas(dir, table) fills a table (and how many dirs exist)
+//   4. we can read flow at adjacent-area centers and see a gradient to climb
+function GxLdBot::NavProbe(player) {
+	GxLdBot.Chat(player, "==== nav-probe (layer-2 API check) ====");
+
+	local bot = null;
+	GxLdBot.ForEachSurvivorBot(function(b) {
+		if (bot == null && GxLdBot.IsAlive(b)) { bot = b; }
+	});
+	if (bot == null) {
+		GxLdBot.Chat(player, "no alive survivor bot to probe");
+		return;
+	}
+	GxLdBot.Chat(player, "probing on: " + GxLdBot.SafeName(bot));
+
+	// 1) GetLastKnownArea
+	local area = null;
+	try {
+		area = bot.GetLastKnownArea();
+	} catch (e) {
+		GxLdBot.Chat(player, "1) GetLastKnownArea THREW: " + e);
+		return;
+	}
+	if (area == null) {
+		GxLdBot.Chat(player, "1) GetLastKnownArea = null (bot off-mesh?) — abort");
+		return;
+	}
+	GxLdBot.Chat(player, "1) GetLastKnownArea OK");
+
+	// 2) GetID / GetCenter / flow at center
+	local baseFlow = null;
+	try {
+		local id = area.GetID();
+		local ctr = area.GetCenter();
+		baseFlow = GxLdBot.GetFlowFor(ctr);
+		GxLdBot.Chat(player, "2) area id=" + id + " centerFlow=" +
+			((baseFlow != null) ? baseFlow : "n/a"));
+	} catch (e2) {
+		GxLdBot.Chat(player, "2) GetID/GetCenter THREW: " + e2);
+		return;
+	}
+
+	// 3) GetAdjacentAreas across directions 0..3, count neighbors + best up-flow.
+	// If direction is a single enum we still cover it by looping 0..3.
+	local totalAdj = 0;
+	local bestUpFlow = baseFlow;
+	local bestDir = -1;
+	for (local dir = 0; dir < 4; dir++) {
+		local adj = {};
+		local ok = false;
+		try {
+			area.GetAdjacentAreas(dir, adj);
+			ok = true;
+		} catch (e3) {
+			GxLdBot.Chat(player, "3) GetAdjacentAreas(dir=" + dir + ") THREW: " + e3);
+		}
+		if (!ok) { continue; }
+		local cnt = 0;
+		foreach (a in adj) {
+			cnt++;
+			try {
+				local f = GxLdBot.GetFlowFor(a.GetCenter());
+				if (f != null && (bestUpFlow == null || f > bestUpFlow)) {
+					bestUpFlow = f;
+					bestDir = dir;
+				}
+			} catch (e4) {}
+		}
+		totalAdj += cnt;
+		GxLdBot.Chat(player, "3) dir=" + dir + " neighbors=" + cnt);
+	}
+	GxLdBot.Chat(player, "3) total adjacent areas=" + totalAdj);
+
+	// 4) gradient verdict
+	if (totalAdj <= 0) {
+		GxLdBot.Chat(player, "4) NO adjacency returned — gradient ascent NOT viable, keep radius scan");
+	} else if (baseFlow != null && bestUpFlow != null && bestUpFlow > baseFlow) {
+		GxLdBot.Chat(player, "4) up-flow neighbor found (+" + (bestUpFlow - baseFlow) +
+			" flow, dir=" + bestDir + ") — GRADIENT ASCENT VIABLE");
+	} else {
+		GxLdBot.Chat(player, "4) adjacency works but no higher-flow neighbor here (may be at a peak/flat)");
+	}
+	GxLdBot.Chat(player, "==== end nav-probe ====");
 }
