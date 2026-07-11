@@ -9,10 +9,15 @@
 // 1.0 first release: layered situation blackboard, flow gradient pathing, guide
 // hold + two-group formation, rubber-band catch-up speed, self-defense-aware
 // assist gating, roguelike cards with movespeed tiers, ladder hand-off, teabag.
+// 1.1-dev3 performance/feel pass: sliced shared threat sampling, single-owner
+// team assist, stable attack targets, calmer gaze, and stronger point/relay lead.
+// 1.1-dev2 completed the buddy architecture: reverse-path safety, five-phase
+// team model, delayed per-bot minds, expression budgeting, stable identity/build
+// cards, player directives, and conservative cross-session style memory.
 
 if (!("GxLdBot" in getroottable())) {
 	::GxLdBot <- {
-		Version = "1.0",
+		Version = "1.1-dev3",
 		Debug = false,
 		DebugFile = false,
 		Initialized = false,
@@ -37,6 +42,41 @@ if (!("GxLdBot" in getroottable())) {
 		LastScoutTarget = {},
 		LastAttack = {},
 		Cards = {},
+		BuildCardsByName = {},
+		BuildCardChapter = "",
+		FormationPlan = {},
+		FormationTime = -999.0,
+		SupportFlowCache = {},
+		SupportFlowCacheTime = -999.0,
+		SupportCoreCache = {},
+		SupportCoreCacheTime = -999.0,
+		ActuatorLease = {},
+		WorldFrame = null,
+		WorldFrameTime = -999.0,
+		WorldSerial = 0,
+		TeamModel = { phase = "SAFE", since = 0.0, lastDangerAt = -999.0,
+			aftermathSince = -1.0, serial = 0 },
+		BotMind = {},
+		HumanModel = { paceEma = 0.0, stalledFor = 0.0, flow = null,
+			lagging = false, exploration = 0.5 },
+		IdentityByName = {},
+		ExpressionPlan = {},
+		ExpressionPlanTime = -999.0,
+		ExpressionTeam = { nextAt = 0.0, initiatorIdx = -1, joinerIdx = -1 },
+		ReversePathCache = {},
+		ReversePathStats = { calls = 0, ok = 0, rejected = 0, errors = 0 },
+		PlayerDirective = { kind = "none", until = 0.0, source = "none" },
+		TeamAssistPlan = { owner = -1, target = null, until = 0.0, frameSerial = -1 },
+		ThreatSampler = { records = {}, specials = [], cursor = 0,
+			lastSliceAt = -999.0, specialAt = -999.0 },
+		HeavySliceCount = 0,
+		StyleMemory = { pace = 0.0, exploration = 0.5, pressure = 0.0, samples = 0 },
+		StyleSession = { distance = 0.0, seconds = 0.0, stalls = 0, pressure = 0,
+			lastOrigin = null, lastAt = -1.0, lastWrite = -999.0 },
+		ConceptProbe = { installed = false, captures = 0, last = "none" },
+		SpeechQueue = [],
+		CheckBack = {},
+		GuideCooldownUntil = {},
 		Action = {},
 		RetreatCooldownUntil = {},
 		ShoveCooldownUntil = {},
@@ -61,7 +101,7 @@ local gxldbotSetSlot = function(tbl, key, value) {
 	}
 };
 
-gxldbotSetSlot(GxLdBot, "Version", "1.0");
+gxldbotSetSlot(GxLdBot, "Version", "1.1-dev3");
 gxldbotSetSlot(GxLdBot, "Initialized", false);
 gxldbotSetSlot(GxLdBot, "Sleeping", false);
 gxldbotSetSlot(GxLdBot, "SleepReason", "");
@@ -69,6 +109,46 @@ gxldbotSetSlot(GxLdBot, "LastNotice", {});
 gxldbotSetSlot(GxLdBot, "LastScoutTarget", {});
 gxldbotSetSlot(GxLdBot, "LastAttack", {});
 gxldbotSetSlot(GxLdBot, "Cards", {});
+if (!("BuildCardsByName" in GxLdBot)) { GxLdBot.BuildCardsByName <- {}; }
+if (!("BuildCardChapter" in GxLdBot)) { GxLdBot.BuildCardChapter <- ""; }
+gxldbotSetSlot(GxLdBot, "FormationPlan", {});
+gxldbotSetSlot(GxLdBot, "FormationTime", -999.0);
+gxldbotSetSlot(GxLdBot, "SupportFlowCache", {});
+gxldbotSetSlot(GxLdBot, "SupportFlowCacheTime", -999.0);
+gxldbotSetSlot(GxLdBot, "SupportCoreCache", {});
+gxldbotSetSlot(GxLdBot, "SupportCoreCacheTime", -999.0);
+gxldbotSetSlot(GxLdBot, "ActuatorLease", {});
+gxldbotSetSlot(GxLdBot, "WorldFrame", null);
+gxldbotSetSlot(GxLdBot, "WorldFrameTime", -999.0);
+gxldbotSetSlot(GxLdBot, "WorldSerial", 0);
+gxldbotSetSlot(GxLdBot, "TeamModel", { phase = "SAFE", since = 0.0,
+	lastDangerAt = -999.0, aftermathSince = -1.0, serial = 0 });
+gxldbotSetSlot(GxLdBot, "BotMind", {});
+gxldbotSetSlot(GxLdBot, "HumanModel", { paceEma = 0.0, stalledFor = 0.0,
+	flow = null, lagging = false, exploration = 0.5 });
+if (!("IdentityByName" in GxLdBot)) { GxLdBot.IdentityByName <- {}; }
+gxldbotSetSlot(GxLdBot, "ExpressionPlan", {});
+gxldbotSetSlot(GxLdBot, "ExpressionPlanTime", -999.0);
+gxldbotSetSlot(GxLdBot, "ExpressionTeam", { nextAt = 0.0,
+	initiatorIdx = -1, joinerIdx = -1 });
+gxldbotSetSlot(GxLdBot, "ReversePathCache", {});
+gxldbotSetSlot(GxLdBot, "ReversePathStats", { calls = 0, ok = 0, rejected = 0, errors = 0 });
+gxldbotSetSlot(GxLdBot, "PlayerDirective", { kind = "none", until = 0.0, source = "none" });
+gxldbotSetSlot(GxLdBot, "TeamAssistPlan", { owner = -1, target = null,
+	until = 0.0, frameSerial = -1 });
+gxldbotSetSlot(GxLdBot, "ThreatSampler", { records = {}, specials = [], cursor = 0,
+	lastSliceAt = -999.0, specialAt = -999.0 });
+gxldbotSetSlot(GxLdBot, "HeavySliceCount", 0);
+gxldbotSetSlot(GxLdBot, "GameLog", { lines = [], lastFlush = -999.0, lastSnap = -999.0, dropped = 0 });
+if (!("StyleMemory" in GxLdBot)) {
+	GxLdBot.StyleMemory <- { pace = 0.0, exploration = 0.5, pressure = 0.0, samples = 0 };
+}
+gxldbotSetSlot(GxLdBot, "StyleSession", { distance = 0.0, seconds = 0.0,
+	stalls = 0, pressure = 0, lastOrigin = null, lastAt = -1.0, lastWrite = -999.0 });
+gxldbotSetSlot(GxLdBot, "ConceptProbe", { installed = false, captures = 0, last = "none" });
+gxldbotSetSlot(GxLdBot, "SpeechQueue", []);
+gxldbotSetSlot(GxLdBot, "CheckBack", {});
+gxldbotSetSlot(GxLdBot, "GuideCooldownUntil", {});
 gxldbotSetSlot(GxLdBot, "Action", {});
 gxldbotSetSlot(GxLdBot, "RetreatCooldownUntil", {});
 gxldbotSetSlot(GxLdBot, "ShoveCooldownUntil", {});
@@ -79,7 +159,6 @@ gxldbotSetSlot(GxLdBot, "BTN_USE", 32);
 gxldbotSetSlot(GxLdBot, "BTN_DUCK", 4); // IN_DUCK — used by the goof-off teabag
 gxldbotSetSlot(GxLdBot, "Goof", {});
 gxldbotSetSlot(GxLdBot, "GoofTeam", { lastStart = -999.0, joinUntil = -999.0 }); // shared teabag timing
-gxldbotSetSlot(GxLdBot, "SpeedBots", {}); // idx -> lagged-movement multiplier for movespeed cards
 gxldbotSetSlot(GxLdBot, "Fidget", {}); // idx -> guide-hold living micro-movement clock
 gxldbotSetSlot(GxLdBot, "Reviving", {});
 gxldbotSetSlot(GxLdBot, "BeingRevived", {});
@@ -178,16 +257,26 @@ gxldbotSetSlot(GxLdBot, "AggressiveCvars", {
 	sb_far_hearing_range = 6500,
 	// Guns-only combat. Aim tracking is crisper than vanilla (2000/350) but NOT
 	// cranked to the max — an over-fast saccade makes the bot's aim jitter/overshoot
-	// and MISS, which is why accuracy felt low last build. These values track
-	// targets snappily while still settling enough to land shots.
-	sb_combat_saccade_speed = 4500,
-	sb_normal_saccade_speed = 2200,
+	// and MISS, which is why accuracy felt low last build. 4500/2200 was the tested
+	// sweet spot; EXPERIMENTAL bump to 6000/2800 for the aggressive test build (user
+	// asked for higher accuracy). WATCH: if aim gets jittery/overshoots and hit rate
+	// DROPS, this went too far — revert to 4500/2200.
+	sb_combat_saccade_speed = 6000,
+	sb_normal_saccade_speed = 2800,
 	sb_use_button_range = 1200,
 	sb_vomit_blind_time = 0,
-	survivor_calm_damage_delay = 0,
-	survivor_calm_deploy_delay = 0,
-	survivor_calm_recent_enemy_delay = 0,
-	survivor_calm_weapon_delay = 0
+	// SELF-HEAL FIX (player: "bots don't heal themselves, and get interrupted a
+	// lot"). vanilla survivor bots only heal while they consider themselves CALM.
+	// A previous aggressive pass zeroed these calm-delays to sharpen reactions, but
+	// with 0 the bot almost never enters the calm window, so it (a) rarely starts a
+	// self-heal and (b) any stray damage/enemy tick re-arms combat and interrupts a
+	// heal that did start. Restore modest calm delays (matching the mild set) so a
+	// bot that walked out of a fight actually settles and heals. Small enough that
+	// aggression is unaffected in real combat.
+	survivor_calm_damage_delay = 4,
+	survivor_calm_deploy_delay = 2,
+	survivor_calm_recent_enemy_delay = 4,
+	survivor_calm_weapon_delay = 4
 });
 
 function GxLdBot::Now() {
@@ -279,6 +368,21 @@ function GxLdBot::IsMultiplayerActive() {
 	return GxLdBot.HumanPlayerCount() > 1;
 }
 
+function GxLdBot::InvalidateWorldFrame() {
+	GxLdBot.WorldFrameTime = -999.0;
+	GxLdBot.ThreatSampler.specialAt = -999.0;
+}
+
+// Every optional engine write checks this again at the driver boundary. The
+// outer think/sleep guards remain, but low-level protection prevents an event or
+// future module from accidentally enacting while gxLdBot is asleep.
+function GxLdBot::CanControlBots() {
+	if (GxLdBot.Sleeping) {
+		return false;
+	}
+	return !GxLdBot.IsMultiplayerActive();
+}
+
 function GxLdBot::Notify(key, msg, cooldown = 0.0) {
 	if (!GxLdBot.Settings.EnableChatEvents) {
 		return;
@@ -308,7 +412,9 @@ function GxLdBot::SetSleeping(value, reason) {
 	GxLdBot.SleepReason = value ? reason : "";
 
 	if (value) {
-		if ("ClearAllActions" in GxLdBot) {
+		if ("QuiesceAll" in GxLdBot) {
+			GxLdBot.QuiesceAll("sleep:" + reason);
+		} else if ("ClearAllActions" in GxLdBot) {
 			GxLdBot.ClearAllActions(true);
 		}
 		GxLdBot.RestoreMildCvars();
@@ -364,6 +470,157 @@ function GxLdBot::WriteDebugLine(line) {
 		StringToFile("gxldbot/debug.txt", output);
 	} catch (e) {
 	}
+}
+
+// ---- persistent game log (append-style diagnostic) --------------------------
+// A growing session log the player asked for: unlike WriteDebugLine (last-80,
+// overwrite), this ACCUMULATES lines in memory and rewrites the whole file every
+// GameLogFlushInterval seconds (Squirrel's StringToFile has no true append mode,
+// so "growing" = keep the full buffer and rewrite). Capped at GameLogMaxLines so
+// a long session can't grow the string unbounded; when full it drops the oldest
+// 20% and keeps going, and marks the file so we know truncation happened. Default
+// ON — file lives at left4dead2/ems/gxldbot/gamelog.txt.
+function GxLdBot::GameLogLine(line) {
+	if (!("EnableGameLog" in GxLdBot.Settings) || !GxLdBot.Settings.EnableGameLog) {
+		return;
+	}
+	try {
+		if (!("GameLog" in GxLdBot) || GxLdBot.GameLog == null) {
+			GxLdBot.GameLog <- { lines = [], lastFlush = -999.0, dropped = 0 };
+		}
+		local log = GxLdBot.GameLog;
+		local stamp = format("%.1f", GxLdBot.Now());
+		log.lines.append(stamp + " " + line);
+
+		local cap = ("GameLogMaxLines" in GxLdBot.Settings) ? GxLdBot.Settings.GameLogMaxLines : 4000;
+		if (log.lines.len() > cap) {
+			// Drop the oldest 20% in one shot (cheaper than remove(0) every line) so
+			// the newest history is always what survives.
+			local drop = (cap / 5).tointeger();
+			if (drop < 1) { drop = 1; }
+			local kept = [];
+			for (local i = drop; i < log.lines.len(); i++) {
+				kept.append(log.lines[i]);
+			}
+			log.dropped += drop;
+			log.lines = kept;
+		}
+	} catch (e) {
+	}
+}
+
+// Flush the accumulated game log to disk on an interval. Called from the arbiter
+// think each tick; only actually writes every GameLogFlushInterval seconds so we
+// are not doing a full-buffer StringToFile every 0.22s tick.
+function GxLdBot::GameLogFlush(force = false) {
+	if (!("EnableGameLog" in GxLdBot.Settings) || !GxLdBot.Settings.EnableGameLog) {
+		return;
+	}
+	if (!("GameLog" in GxLdBot) || GxLdBot.GameLog == null) {
+		return;
+	}
+	local now = GxLdBot.Now();
+	local interval = ("GameLogFlushInterval" in GxLdBot.Settings)
+		? GxLdBot.Settings.GameLogFlushInterval : 2.0;
+	if (!force && (now - GxLdBot.GameLog.lastFlush) < interval) {
+		return;
+	}
+	GxLdBot.GameLog.lastFlush = now;
+	try {
+		local header = "=== gxLdBot game log (dropped " + GxLdBot.GameLog.dropped +
+			" old lines) ===\n";
+		local output = header;
+		foreach (idx, item in GxLdBot.GameLog.lines) {
+			output += item + "\n";
+		}
+		StringToFile("gxldbot/gamelog.txt", output);
+	} catch (e) {
+	}
+}
+
+// Per-bot snapshot sampler. Called every arbiter tick but self-throttled to
+// GameLogInterval so we get ~1 row/bot/sec, not one per 0.22s tick. Captures the
+// fields we need to data-mine handfeel + the heal problem after a play session:
+// hp (real + temp), whether it has a medkit, its heal intent, formation slot,
+// current action kind, distance to nearest human, team phase, and combat flags.
+// All reads are guarded — a logger must never be able to crash the game.
+function GxLdBot::GameLogSample() {
+	if (!("EnableGameLog" in GxLdBot.Settings) || !GxLdBot.Settings.EnableGameLog) {
+		return;
+	}
+	if (!("GameLog" in GxLdBot) || GxLdBot.GameLog == null) {
+		return;
+	}
+	local now = GxLdBot.Now();
+	local interval = ("GameLogInterval" in GxLdBot.Settings)
+		? GxLdBot.Settings.GameLogInterval : 1.0;
+	if ((now - GxLdBot.GameLog.lastSnap) >= interval) {
+		GxLdBot.GameLog.lastSnap = now;
+
+		// Team-level context once per snapshot round.
+		local phase = "?";
+		try {
+			if ("TeamModel" in GxLdBot && "phase" in GxLdBot.TeamModel) {
+				phase = GxLdBot.TeamModel.phase;
+			}
+		} catch (etp) {}
+		local combat = "?";
+		try {
+			if ("GetSituation" in GxLdBot) {
+				local frame = GxLdBot.GetSituation();
+				combat = (frame.combat ? "combat" : "clear") +
+					(frame.emergencyVictim != null ? "+emerg" : "");
+			}
+		} catch (esit) {}
+
+		GxLdBot.ForEachSurvivorBot(function(bot) {
+			try {
+				if (!GxLdBot.IsValidEntity(bot) || !GxLdBot.IsAlive(bot)) { return; }
+				local idx = bot.GetEntityIndex();
+				local name = GxLdBot.SafeName(bot);
+				local hp = ("HealthOf" in GxLdBot) ? GxLdBot.HealthOf(bot) : -1;
+				local perm = -1;
+				try { perm = bot.GetHealth(); } catch (eh) {}
+				local hasKit = ("HasMedkit" in GxLdBot) && GxLdBot.HasMedkit(bot);
+				local wantHeal = ("HealIntent" in GxLdBot) && (idx in GxLdBot.HealIntent)
+					&& GxLdBot.HealIntent[idx];
+				local slot = ("FormationSlotFor" in GxLdBot) ? GxLdBot.FormationSlotFor(bot) : "-";
+				local act = "-";
+				local reason = "-";
+				if ("Action" in GxLdBot && idx in GxLdBot.Action) {
+					local a = GxLdBot.Action[idx];
+					if ("kind" in a) { act = a.kind; }
+					if ("reason" in a) { reason = a.reason; }
+				}
+				local human = ("NearestHuman" in GxLdBot) ? GxLdBot.NearestHuman(bot) : null;
+				local distH = -1;
+				if (human != null) {
+					try { distH = GxLdBot.DistanceBetween(bot, human).tointeger(); } catch (ed) {}
+				}
+				local incap = false;
+				try { incap = bot.IsIncapacitated(); } catch (ei) {}
+				local bfLog = -1;
+				try { local v = GxLdBot.GetFlowFor(bot.GetOrigin()); if (v != null) { bfLog = v.tointeger(); } } catch (ebf) {}
+				local hfLog = -1;
+				try { local v2 = GxLdBot.HumanMaxFlow(); if (v2 != null) { hfLog = v2.tointeger(); } } catch (ehf) {}
+				local mfLog = -1;
+				try { local v3 = ("TeamMinFlow" in GxLdBot) ? GxLdBot.TeamMinFlow() : null; if (v3 != null) { mfLog = v3.tointeger(); } } catch (emf) {}
+				GxLdBot.GameLogLine(name +
+					" hp=" + hp + " perm=" + perm +
+					" kit=" + (hasKit ? 1 : 0) +
+					" wantHeal=" + (wantHeal ? 1 : 0) +
+					" slot=" + slot +
+					" act=" + act + "/" + reason +
+					" distH=" + distH +
+					" phase=" + phase +
+					" sit=" + combat +
+					" bf=" + bfLog + " hf=" + hfLog + " mf=" + mfLog +
+					(incap ? " INCAP" : ""));
+			} catch (ebot) {}
+		});
+	}
+	// Flush is separately throttled (GameLogFlushInterval); safe to call each tick.
+	GxLdBot.GameLogFlush(false);
 }
 
 function GxLdBot::RandFloat(minValue, maxValue) {
@@ -440,7 +697,9 @@ function GxLdBot::ApplyMode(mode, announce = false, player = null) {
 
 	GxLdBot.LastScout = {};
 	GxLdBot.LastScoutTarget = {};
-	if ("ClearAllActions" in GxLdBot) {
+	if ("QuiesceAll" in GxLdBot) {
+		GxLdBot.QuiesceAll("mode_change");
+	} else if ("ClearAllActions" in GxLdBot) {
 		GxLdBot.ClearAllActions(true);
 	}
 	if ("ApplyRoleMode" in GxLdBot) {
@@ -758,11 +1017,28 @@ function GxLdBot::MakeProfile(player) {
 		healThreshold = GxLdBot.RandInt(healMin, healMax),
 		letItemBias = GxLdBot.RandInt(0, 60)
 	};
+	// Identity is stable across chapters/sessions; build cards layer on top later.
+	// The fallback random profile remains valid if the identity module is absent.
+	if ("ApplyIdentityToProfile" in GxLdBot) {
+		try { GxLdBot.ApplyIdentityToProfile(player, profile); } catch (identityError) {
+			GxLdBot.Log("identity apply failed: " + identityError, true);
+		}
+	}
 
 	profile.followDistance = followBase + profile.personalFollowOffset;
 	if (profile.followDistance < 140) {
 		profile.followDistance = 140;
 	}
+	profile.baseReaction <- profile.reaction;
+	profile.baseRescueBias <- profile.rescueBias;
+	profile.baseComposure <- profile.composureBase;
+	profile.baseWaitBias <- profile.waitBias;
+	profile.baseInteractionBias <- profile.interactionBias;
+	profile.baseItemCuriosity <- profile.itemCuriosity;
+	profile.baseStressRiseMul <- ("stressRiseMul" in profile) ? profile.stressRiseMul : 1.0;
+	profile.baseStressDecayMul <- ("stressDecayMul" in profile) ? profile.stressDecayMul : 1.0;
+	profile.baseMomentumGainMul <- ("momentumGainMul" in profile) ? profile.momentumGainMul : 1.0;
+	profile.baseSocialGainMul <- ("socialGainMul" in profile) ? profile.socialGainMul : 1.0;
 
 	return profile;
 }
@@ -774,9 +1050,13 @@ function GxLdBot::ClearBotState(idx) {
 	try {
 		local ent = EntIndexToHScript(idx);
 		if (ent != null && GxLdBot.IsValidEntity(ent)) {
-			if ("ClearShove" in GxLdBot) { GxLdBot.ClearShove(ent); }
-			if ("ClearHeal" in GxLdBot) { GxLdBot.ClearHeal(ent); }
-			if ("ClearGoof" in GxLdBot) { GxLdBot.ClearGoof(ent); }
+			if ("QuiesceBot" in GxLdBot) {
+				GxLdBot.QuiesceBot(ent, "bot_state_clear", true);
+			} else {
+				if ("ClearShove" in GxLdBot) { GxLdBot.ClearShove(ent); }
+				if ("ClearHeal" in GxLdBot) { GxLdBot.ClearHeal(ent); }
+				if ("ClearGoof" in GxLdBot) { GxLdBot.ClearGoof(ent); }
+			}
 		}
 	} catch (e) {}
 	if (idx in GxLdBot.Profiles) {
@@ -787,6 +1067,9 @@ function GxLdBot::ClearBotState(idx) {
 	}
 	if (idx in GxLdBot.Composure) {
 		delete GxLdBot.Composure[idx];
+	}
+	if ("BotMind" in GxLdBot && idx in GxLdBot.BotMind) {
+		delete GxLdBot.BotMind[idx];
 	}
 	if (idx in GxLdBot.LastSpeak) {
 		delete GxLdBot.LastSpeak[idx];
@@ -802,9 +1085,6 @@ function GxLdBot::ClearBotState(idx) {
 	}
 	if ("Goof" in GxLdBot && idx in GxLdBot.Goof) {
 		delete GxLdBot.Goof[idx];
-	}
-	if ("SpeedBots" in GxLdBot && idx in GxLdBot.SpeedBots) {
-		delete GxLdBot.SpeedBots[idx];
 	}
 	if ("Fidget" in GxLdBot && idx in GxLdBot.Fidget) {
 		delete GxLdBot.Fidget[idx];
@@ -832,6 +1112,18 @@ function GxLdBot::ClearBotState(idx) {
 	}
 	if ("HealIntent" in GxLdBot && idx in GxLdBot.HealIntent) {
 		delete GxLdBot.HealIntent[idx];
+	}
+	if ("ActuatorLease" in GxLdBot && idx in GxLdBot.ActuatorLease) {
+		delete GxLdBot.ActuatorLease[idx];
+	}
+	if ("CheckBack" in GxLdBot && idx in GxLdBot.CheckBack) {
+		delete GxLdBot.CheckBack[idx];
+	}
+	if ("GuideCooldownUntil" in GxLdBot && idx in GxLdBot.GuideCooldownUntil) {
+		delete GxLdBot.GuideCooldownUntil[idx];
+	}
+	if ("ExpressionPlan" in GxLdBot && idx in GxLdBot.ExpressionPlan) {
+		delete GxLdBot.ExpressionPlan[idx];
 	}
 
 	local deadClaims = [];
@@ -1003,9 +1295,11 @@ function GxLdBot::TrackedSetCvar(name, value) {
 			GxLdBot.CvarBackup[name] <- Convars.GetFloat(name);
 		}
 		Convars.SetValue(name, value);
+		return true;
 	} catch (e) {
 		GxLdBot.Log("TrackedSetCvar " + name + " failed: " + e, true);
 	}
+	return false;
 }
 
 // True once any survivor has stepped out of the start saferoom. Until then we
@@ -1086,12 +1380,12 @@ function GxLdBot::UpdateDynamicCvars() {
 		GxLdBot.TrackedSetCvar("sb_threat_very_far_range", 9000);
 		GxLdBot.TrackedSetCvar("sb_near_hearing_range", 5000);
 		GxLdBot.TrackedSetCvar("sb_far_hearing_range", 9000);
-		// Match the stable aggressive aim values (4500/2200) — NOT 9999. An over-fast
-		// saccade makes the bot's aim jitter/overshoot and MISS, exactly when a rescue
-		// needs to land shots. Emergency already boosts perception ranges above; the aim
-		// tracking stays at the tuned snappy-but-settling value.
-		GxLdBot.TrackedSetCvar("sb_combat_saccade_speed", 4500);
-		GxLdBot.TrackedSetCvar("sb_normal_saccade_speed", 2200);
+		// EXPERIMENTAL (aggressive build): match the aggressive aim values, now bumped
+		// to 6000/2800 from the tuned 4500/2200. Still well under the 9999 that caused
+		// jitter/overshoot/miss — this is a probe to see if snappier tracking reads as
+		// more accurate or reintroduces the shake. Revert to 4500/2200 if aim degrades.
+		GxLdBot.TrackedSetCvar("sb_combat_saccade_speed", 6000);
+		GxLdBot.TrackedSetCvar("sb_normal_saccade_speed", 2800);
 		GxLdBot.TrackedSetCvar("sb_separation_range", 90);
 		GxLdBot.TrackedSetCvar("sb_neighbor_range", 140);
 		return;
@@ -1230,6 +1524,7 @@ function GxLdBot::PrintProfiles(player) {
 			" rescue=" + p.rescueBias +
 			" follow=" + p.followDistance +
 			" lead=" + p.leadBias +
+			" identity=" + (("identityId" in p) ? p.identityId : "none") +
 			" card=" + (("cardName" in p) ? p.cardName : "None") +
 			" item=" + p.itemCuriosity +
 			" throwable=" + p.throwableBias +
@@ -1272,6 +1567,11 @@ function GxLdBot::PrintStatus(player) {
 		" cover=" + GxLdBot.Settings.EnableCover +
 		" shove=" + GxLdBot.Settings.EnableShove +
 		" assist=" + GxLdBot.Settings.EnableAssist);
+	if ("TeamModel" in GxLdBot) {
+		GxLdBot.Chat(player, "phase=" + GxLdBot.TeamModel.phase +
+			" reversePath=" + GxLdBot.Settings.ReversePathEnable +
+			" expressions=" + GxLdBot.Settings.EnableExpressions);
+	}
 }
 
 // One-shot aggregate dump: status + roles + actions + progress in a single
@@ -1287,6 +1587,8 @@ function GxLdBot::PrintDump(player) {
 	if ("PrintActions" in GxLdBot) { GxLdBot.SafeCall("dump_actions", function() { GxLdBot.PrintActions(player); }); }
 	GxLdBot.Chat(player, "-- progress --");
 	if ("PrintProgress" in GxLdBot) { GxLdBot.SafeCall("dump_progress", function() { GxLdBot.PrintProgress(player); }); }
+	GxLdBot.Chat(player, "-- minds --");
+	if ("PrintMinds" in GxLdBot) { GxLdBot.SafeCall("dump_minds", function() { GxLdBot.PrintMinds(player); }); }
 	GxLdBot.Chat(player, "==== end dump ====");
 }
 
@@ -1425,15 +1727,9 @@ function GxLdBot::HandleCommand(player, text) {
 
 	if (text == "!hbot_cards_toggle") {
 		GxLdBot.Settings.EnableCards = !GxLdBot.Settings.EnableCards;
-		// When turning cards OFF, CardsThink() early-returns and stops writing
-		// m_flLaggedMovementValue — so any speed a speed-card / rubber-band wrote
-		// last tick stays stuck. Restore every bot to vanilla movespeed (1.0) so
-		// "cards=false" actually means normal speed, not a frozen fast/slow value.
-		if (!GxLdBot.Settings.EnableCards) {
-			GxLdBot.ForEachSurvivorBot(function(bot) {
-				try { NetProps.SetPropFloat(bot, "m_flLaggedMovementValue", 1.0); } catch (e) {}
-			});
-		}
+		// Movement-speed NetProp overrides are disabled during the buddy rework.
+		// Do not write 1.0 here: that value may currently belong to an engine slow
+		// effect, not to gxLdBot.
 		if ("AssignRoles" in GxLdBot) {
 			GxLdBot.AssignRoles();
 		}
@@ -1520,9 +1816,44 @@ function GxLdBot::HandleCommand(player, text) {
 		return true;
 	}
 
+	if (text == "!hbot_minds") {
+		if ("PrintMinds" in GxLdBot) { GxLdBot.PrintMinds(player); }
+		return true;
+	}
+
+	if (text == "!hbot_conceptprobe") {
+		GxLdBot.Chat(player, "concept endpoint=" + GxLdBot.ConceptProbe.installed +
+			" captures=" + GxLdBot.ConceptProbe.captures + " last=" + GxLdBot.ConceptProbe.last);
+		GxLdBot.Chat(player, "native capture requires ResponseRules/VSLib to call GxLdBot_OnConcept");
+		return true;
+	}
+
+	if (text == "!hbot_wait") {
+		GxLdBot.SetPlayerDirective("wait", "command", player);
+		return true;
+	}
+	if (text == "!hbot_moveon") {
+		GxLdBot.SetPlayerDirective("moveon", "command", player);
+		return true;
+	}
+	if (text == "!hbot_look") {
+		GxLdBot.SetPlayerDirective("look", "command", player);
+		return true;
+	}
+	if (text == "!hbot_style") {
+		GxLdBot.Chat(player, "remembered pace=" + GxLdBot.StyleMemory.pace +
+			" exploration=" + GxLdBot.StyleMemory.exploration +
+			" pressure=" + GxLdBot.StyleMemory.pressure +
+			" samples=" + GxLdBot.StyleMemory.samples);
+		return true;
+	}
+
 	if (text == "!hbot_actions_toggle") {
 		GxLdBot.Settings.EnableActions = !GxLdBot.Settings.EnableActions;
-		if (!GxLdBot.Settings.EnableActions && "ClearAllActions" in GxLdBot) {
+		if (!GxLdBot.Settings.EnableActions && "QuiesceAll" in GxLdBot) {
+			GxLdBot.QuiesceAll("command_disable");
+			GxLdBot.ActionDisabledCleaned = true;
+		} else if (!GxLdBot.Settings.EnableActions && "ClearAllActions" in GxLdBot) {
 			GxLdBot.ClearAllActions(true);
 			GxLdBot.ActionDisabledCleaned = true;
 		}
@@ -1625,6 +1956,7 @@ function GxLdBot::HandleCommand(player, text) {
 		GxLdBot.Chat(player, "!hbot_actions !hbot_actions_toggle !hbot_rescue !hbot_retreat !hbot_cover !hbot_shove !hbot_assist");
 		GxLdBot.Chat(player, "!hbot_progress !hbot_progress_status !hbot_cards !hbot_reroll_cards !hbot_cards_toggle");
 		GxLdBot.Chat(player, "!hbot_roles !hbot_focus !hbot_claims !hbot_dump");
+		GxLdBot.Chat(player, "!hbot_minds !hbot_navprobe !hbot_conceptprobe !hbot_wait !hbot_moveon !hbot_look !hbot_style");
 		return true;
 	}
 
@@ -1820,9 +2152,45 @@ function GxLdBot::RoundStart() {
 		return;
 	}
 	GxLdBot.LastRoundInit = now;
+	if ("QuiesceAll" in GxLdBot) {
+		GxLdBot.QuiesceAll("round_start");
+	}
 
 	GxLdBot.Profiles = {};
 	GxLdBot.Cards = {};
+	if ("PrepareBuildCardsForChapter" in GxLdBot) {
+		GxLdBot.PrepareBuildCardsForChapter();
+	}
+	GxLdBot.FormationPlan = {};
+	GxLdBot.FormationTime = -999.0;
+	GxLdBot.SupportFlowCache = {};
+	GxLdBot.SupportFlowCacheTime = -999.0;
+	GxLdBot.SupportCoreCache = {};
+	GxLdBot.SupportCoreCacheTime = -999.0;
+	GxLdBot.ActuatorLease = {};
+	GxLdBot.WorldFrame = null;
+	GxLdBot.WorldFrameTime = -999.0;
+	GxLdBot.WorldSerial = 0;
+	GxLdBot.TeamModel = { phase = "SAFE", since = now, lastDangerAt = -999.0,
+		aftermathSince = -1.0, serial = 0 };
+	GxLdBot.BotMind = {};
+	GxLdBot.HumanModel = { paceEma = 0.0, stalledFor = 0.0, flow = null,
+		lagging = false, exploration = GxLdBot.StyleMemory.exploration };
+	GxLdBot.ExpressionPlan = {};
+	GxLdBot.ExpressionPlanTime = -999.0;
+	GxLdBot.ExpressionTeam = { nextAt = now + 2.0, initiatorIdx = -1, joinerIdx = -1 };
+	GxLdBot.ReversePathCache = {};
+	GxLdBot.ReversePathStats = { calls = 0, ok = 0, rejected = 0, errors = 0 };
+	GxLdBot.PlayerDirective = { kind = "none", until = 0.0, source = "none" };
+	GxLdBot.TeamAssistPlan = { owner = -1, target = null, until = 0.0, frameSerial = -1 };
+	GxLdBot.ThreatSampler = { records = {}, specials = [], cursor = 0,
+		lastSliceAt = -999.0, specialAt = -999.0 };
+	GxLdBot.HeavySliceCount = 0;
+	GxLdBot.SpeechQueue = [];
+	GxLdBot.StyleSession = { distance = 0.0, seconds = 0.0, stalls = 0, pressure = 0,
+		lastOrigin = null, lastAt = -1.0, lastWrite = now };
+	GxLdBot.CheckBack = {};
+	GxLdBot.GuideCooldownUntil = {};
 	GxLdBot.Focus = {};
 	GxLdBot.Composure = {};
 	GxLdBot.Claims = {};
@@ -1831,7 +2199,6 @@ function GxLdBot::RoundStart() {
 	GxLdBot.LastScoutTarget = {};
 	GxLdBot.LastAttack = {};
 	GxLdBot.Goof = {};
-	GxLdBot.SpeedBots = {};
 	GxLdBot.Fidget = {};
 	GxLdBot.Reviving = {};
 	GxLdBot.BeingRevived = {};
@@ -1868,6 +2235,12 @@ function GxLdBot::Init() {
 	}
 
 	GxLdBot.Initialized = true;
+	if ("LoadStyleMemory" in GxLdBot) {
+		GxLdBot.SafeCall("style_memory_load", function() { GxLdBot.LoadStyleMemory(); });
+	}
+	if ("InstallConceptProbe" in GxLdBot) {
+		GxLdBot.SafeCall("concept_probe_install", function() { GxLdBot.InstallConceptProbe(); });
+	}
 	GxLdBot.ApplyMode(GxLdBot.Settings.Mode, false, null);
 	GxLdBot.StartThink();
 	GxLdBot.UpdateSleepState();
@@ -1924,6 +2297,30 @@ GxLdBot.Events.OnGameEvent_player_say <- function(event) {
 
 GxLdBot.Events.OnGameEvent_player_death <- function(event) {
 	::GxLdBot.ClearReviveStateFor(::GxLdBot.PlayerFromEvent(event, "userid"));
+}
+
+local gxldbotSaveStyleEvent = function(reason) {
+	if ("SaveStyleMemory" in ::GxLdBot) {
+		::GxLdBot.SafeCall("style_memory_" + reason, function() {
+			::GxLdBot.SaveStyleMemory(reason);
+		});
+	}
+};
+
+GxLdBot.Events.OnGameEvent_map_transition <- function(event) {
+	gxldbotSaveStyleEvent("map_transition");
+}
+
+GxLdBot.Events.OnGameEvent_finale_win <- function(event) {
+	gxldbotSaveStyleEvent("finale_win");
+}
+
+GxLdBot.Events.OnGameEvent_mission_lost <- function(event) {
+	gxldbotSaveStyleEvent("mission_lost");
+}
+
+GxLdBot.Events.OnGameEvent_round_end <- function(event) {
+	gxldbotSaveStyleEvent("round_end");
 }
 
 GxLdBot.Events.OnGameEvent_revive_begin <- function(event) {

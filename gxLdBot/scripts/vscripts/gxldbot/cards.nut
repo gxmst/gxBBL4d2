@@ -1,4 +1,4 @@
-// gxLdBot cards module: roguelike-style per-bot build modifiers.
+// gxLdBot cards module: chapter-scoped build modifiers over stable identities.
 //
 // Cards intentionally modify existing decision surfaces instead of issuing
 // commands directly. This keeps them expressive without creating another
@@ -16,10 +16,9 @@ local gxldbotCardSet = function(key, value) {
 // odds (common » rare » legendary). The personalities are sharper and read as
 // distinct teammates, not eight variations of one number.
 //
-// Fields: rarity sets weight (see CardRarityWeight below).
-//   speedMul  -> movement-speed multiplier via m_flLaggedMovementValue (only bots
-//                with a speed card get their prop touched; see SpeedBots).
-//   signature -> short label shown in dump so a rare/legendary reads special.
+// Fields: rarity sets weight (see CardRarityWeight below). Curve modifiers tune
+// stress recovery, momentum and expression energy; cards never write movement
+// NetProps. signature is the short label shown in the dump.
 // All the *Add / *Mul stat fields feed ApplyCardToProfile; the framework is
 // untouched, only the DATA got richer.
 gxldbotCardSet("CardRarityWeight", { common = 14, rare = 8, legendary = 5 });
@@ -69,10 +68,10 @@ gxldbotCardSet("CardDefs", [
 	},
 	{
 		id = "ranger", name = "Ranger", rarity = "rare",
-		desc = "light-footed flanker, moves a clear step quicker",
+		desc = "mobile flanker: builds momentum quickly and checks side routes",
 		followAdd = 35, leadAdd = 12, progressLeadAdd = 120, maxSepAdd = 60,
 		reactionMul = 0.85, assistRadiusAdd = 80, assistMaxAdd = 180,
-		speedMul = 1.12, signature = "fleet-footed",
+		momentumGainMul = 1.25, interactionAdd = 8, signature = "trail sense",
 	},
 	{
 		id = "berserker", name = "Berserker", rarity = "rare",
@@ -106,16 +105,17 @@ gxldbotCardSet("CardDefs", [
 	},
 	{
 		id = "sprinter", name = "Sprinter", rarity = "legendary",
-		desc = "quicksilver scout: noticeably faster on foot, ranges ahead",
+		desc = "quicksilver scout: recovers initiative fast and ranges ahead",
 		followAdd = 45, leadAdd = 18, progressLeadAdd = 150, maxSepAdd = 100,
 		reactionMul = 0.85, composureAdd = 6,
-		speedMul = 1.28, signature = "quicksilver",
+		momentumGainMul = 1.45, stressDecayMul = 1.2, signature = "quicksilver",
 	},
 	{
 		id = "ace", name = "Ace", rarity = "legendary",
-		desc = "the complete player: fast, calm, mobile, always there for you",
+		desc = "the complete player: calm, decisive, social, always there for you",
 		followAdd = 15, leadAdd = 12, progressLeadAdd = 130, maxSepAdd = 60,
-		reactionMul = 0.6, composureAdd = 22, rescueAdd = 14, speedMul = 1.14,
+		reactionMul = 0.6, composureAdd = 22, rescueAdd = 14,
+		momentumGainMul = 1.2, socialGainMul = 1.2, interactionAdd = 12,
 		signature = "the ace",
 	},
 ]);
@@ -152,6 +152,25 @@ function GxLdBot::CardById(id) {
 		}
 	}
 	return null;
+}
+
+function GxLdBot::CurrentChapterName() {
+	try { return Director.GetMapName(); } catch (e) {}
+	try { return GetMapName(); } catch (e2) {}
+	return "unknown";
+}
+
+function GxLdBot::PrepareBuildCardsForChapter() {
+	local chapter = GxLdBot.CurrentChapterName();
+	if (GxLdBot.BuildCardChapter == "") {
+		GxLdBot.BuildCardChapter = chapter;
+		return;
+	}
+	if (chapter != "unknown" && chapter != GxLdBot.BuildCardChapter) {
+		GxLdBot.BuildCardsByName = {};
+		GxLdBot.BuildCardChapter = chapter;
+		GxLdBot.Log("new chapter build draw: " + chapter, true);
+	}
 }
 
 // Draw weight of a card: explicit weight wins (back-compat), else derived from
@@ -231,6 +250,10 @@ function GxLdBot::ResetCardMods(profile) {
 	GxLdBot.CardProfileSet(profile, "cardRetreatRadiusAdd", 0.0);
 	GxLdBot.CardProfileSet(profile, "cardRetreatCountAdd", 0);
 	GxLdBot.CardProfileSet(profile, "cardRetreatDurationMul", 1.0);
+	GxLdBot.CardProfileSet(profile, "cardStressRiseMul", 1.0);
+	GxLdBot.CardProfileSet(profile, "cardStressDecayMul", 1.0);
+	GxLdBot.CardProfileSet(profile, "cardMomentumGainMul", 1.0);
+	GxLdBot.CardProfileSet(profile, "cardSocialGainMul", 1.0);
 }
 
 function GxLdBot::AssignCard(idx, reason = "roll", excludeCurrent = false, forceId = null) {
@@ -254,9 +277,13 @@ function GxLdBot::AssignCard(idx, reason = "roll", excludeCurrent = false, force
 		name = card.name,
 		desc = ("desc" in card) ? card.desc : "",
 		since = now,
-		nextRoll = now + GxLdBot.Settings.CardRerollInterval
+		nextRoll = -1.0
 	};
 	GxLdBot.SetTableSlot(GxLdBot.Cards, idx, entry);
+	if (idx in GxLdBot.Profiles) {
+		local buildKey = GxLdBot.Profiles[idx].name.tolower();
+		GxLdBot.SetTableSlot(GxLdBot.BuildCardsByName, buildKey, card.id);
+	}
 	GxLdBot.Log("card " + idx + " -> " + card.name + " reason=" + reason, true);
 	local who = "bot#" + idx;
 	if (idx in GxLdBot.Profiles && "name" in GxLdBot.Profiles[idx]) {
@@ -284,6 +311,13 @@ function GxLdBot::AssignCard(idx, reason = "roll", excludeCurrent = false, force
 
 function GxLdBot::EnsureCard(idx) {
 	if (!(idx in GxLdBot.Cards)) {
+		if (idx in GxLdBot.Profiles) {
+			local buildKey = GxLdBot.Profiles[idx].name.tolower();
+			if (buildKey in GxLdBot.BuildCardsByName) {
+				return GxLdBot.AssignCard(idx, "chapter_restore", false,
+					GxLdBot.BuildCardsByName[buildKey]);
+			}
+		}
 		return GxLdBot.AssignCard(idx, "initial", false);
 	}
 	local card = GxLdBot.CardById(GxLdBot.Cards[idx].id);
@@ -295,6 +329,18 @@ function GxLdBot::EnsureCard(idx) {
 
 function GxLdBot::ApplyCardToProfile(idx, profile) {
 	GxLdBot.ResetCardMods(profile);
+	// Rebase identity/personality values before applying a chapter build so role
+	// reassignment or debug regeneration never compounds card modifiers.
+	if ("baseReaction" in profile) { profile.reaction = profile.baseReaction; }
+	if ("baseRescueBias" in profile) { profile.rescueBias = profile.baseRescueBias; }
+	if ("baseComposure" in profile) { profile.composureBase = profile.baseComposure; }
+	if ("baseWaitBias" in profile) { profile.waitBias = profile.baseWaitBias; }
+	if ("baseInteractionBias" in profile) { profile.interactionBias = profile.baseInteractionBias; }
+	if ("baseItemCuriosity" in profile) { profile.itemCuriosity = profile.baseItemCuriosity; }
+	if ("baseStressRiseMul" in profile) { profile.stressRiseMul = profile.baseStressRiseMul; }
+	if ("baseStressDecayMul" in profile) { profile.stressDecayMul = profile.baseStressDecayMul; }
+	if ("baseMomentumGainMul" in profile) { profile.momentumGainMul = profile.baseMomentumGainMul; }
+	if ("baseSocialGainMul" in profile) { profile.socialGainMul = profile.baseSocialGainMul; }
 	if (!GxLdBot.Settings.EnableCards) {
 		return;
 	}
@@ -322,6 +368,10 @@ function GxLdBot::ApplyCardToProfile(idx, profile) {
 	profile.waitBias = GxLdBot.CardClamp(
 		profile.waitBias + GxLdBot.CardValue(card, "waitAdd", 0),
 		0, 100);
+	profile.interactionBias = GxLdBot.CardClamp(
+		profile.interactionBias + GxLdBot.CardValue(card, "interactionAdd", 0), 0, 100);
+	profile.itemCuriosity = GxLdBot.CardClamp(
+		profile.itemCuriosity + GxLdBot.CardValue(card, "curiosityAdd", 0), 0, 100);
 
 	profile.cardProgressLeadBonus = GxLdBot.CardValue(card, "progressLeadAdd", 0).tofloat();
 	profile.cardMaxSeparationAdd = GxLdBot.CardValue(card, "maxSepAdd", 0).tofloat();
@@ -333,16 +383,14 @@ function GxLdBot::ApplyCardToProfile(idx, profile) {
 	profile.cardRetreatRadiusAdd = GxLdBot.CardValue(card, "retreatRadiusAdd", 0).tofloat();
 	profile.cardRetreatCountAdd = GxLdBot.CardValue(card, "retreatCountAdd", 0);
 	profile.cardRetreatDurationMul = GxLdBot.CardValue(card, "retreatDurationMul", 1.0).tofloat();
-
-	// Signature ability: movespeed (some rare/legendary cards). Record the target
-	// lagged-movement multiplier in the shared SpeedBots table; the cards think
-	// applies it via m_flLaggedMovementValue only for flagged bots, so ordinary
-	// bots keep vanilla speed (and vanilla slowdowns like spitter/tank still work).
-	if (!("SpeedBots" in GxLdBot)) {
-		GxLdBot.SpeedBots <- {};
-	}
-	local spd = (("speedMul" in card) && card.speedMul > 0) ? card.speedMul.tofloat() : 1.0;
-	GxLdBot.SetTableSlot(GxLdBot.SpeedBots, idx, spd);
+	profile.cardStressRiseMul = GxLdBot.CardValue(card, "stressRiseMul", 1.0).tofloat();
+	profile.cardStressDecayMul = GxLdBot.CardValue(card, "stressDecayMul", 1.0).tofloat();
+	profile.cardMomentumGainMul = GxLdBot.CardValue(card, "momentumGainMul", 1.0).tofloat();
+	profile.cardSocialGainMul = GxLdBot.CardValue(card, "socialGainMul", 1.0).tofloat();
+	if ("stressRiseMul" in profile) { profile.stressRiseMul *= profile.cardStressRiseMul; }
+	if ("stressDecayMul" in profile) { profile.stressDecayMul *= profile.cardStressDecayMul; }
+	if ("momentumGainMul" in profile) { profile.momentumGainMul *= profile.cardMomentumGainMul; }
+	if ("socialGainMul" in profile) { profile.socialGainMul *= profile.cardSocialGainMul; }
 }
 
 function GxLdBot::RerollAllCards(reason = "reroll") {
@@ -357,59 +405,94 @@ function GxLdBot::RerollAllCards(reason = "reroll") {
 }
 
 function GxLdBot::CardsThink() {
+	// Rubber-band is a movement actuator, not a card stat. Keep it in this existing
+	// low-frequency pass for cost control, but route every write through the shared
+	// lease driver in actions.nut.
+	if (("LeaseMovementBoost" in GxLdBot) && ("ReleaseMovementBoost" in GxLdBot)) {
+		GxLdBot.ForEachSurvivorBot(function(bot) {
+			local shouldBoost = GxLdBot.Settings.RubberBandEnable &&
+				GxLdBot.Settings.EnableActions && GxLdBot.IsAlive(bot) &&
+				(!("IsUncommandable" in GxLdBot) || !GxLdBot.IsUncommandable(bot));
+			if (!shouldBoost || !("BotCentroidDispersion" in GxLdBot)) {
+				GxLdBot.ReleaseMovementBoost(bot, "rubberband_inactive");
+				return;
+			}
+
+			// Do not accelerate a forward point/relay. With usable flow, boost only a
+			// bot genuinely behind the human; on flat-flow maps, reserve it for rear/flex.
+			local behind = true;
+			if (("HumanMaxFlow" in GxLdBot) && ("GetFlowFor" in GxLdBot)) {
+				local humanFlow = GxLdBot.HumanMaxFlow();
+				local botFlow = null;
+				try { botFlow = GxLdBot.GetFlowFor(bot.GetOrigin()); } catch (eflow) {}
+				if (humanFlow != null && botFlow != null) {
+					behind = botFlow + GxLdBot.Settings.ProgressFlowTolerance < humanFlow;
+				} else if (("FormationSlotFor" in GxLdBot)) {
+					local slot = GxLdBot.FormationSlotFor(bot);
+					behind = slot != "point" && slot != "relay";
+				}
+			}
+			if (!behind) {
+				GxLdBot.ReleaseMovementBoost(bot, "rubberband_not_behind");
+				return;
+			}
+
+			// Boost strength = MAX of two drivers:
+			//   (a) centroid dispersion — the old "bot strayed from the squad" signal.
+			//   (b) FLOW deficit behind the human — the fix for "player rushes ahead
+			//       solo". When you sprint out front, the two other bots stay clustered
+			//       so the straggler's dispersion from THEIR centroid stays small and (a)
+			//       never fires — yet it is hundreds of flow behind YOU. Data: bots sat
+			//       avg -509 flow behind an aggressive player while stuck on vanilla/
+			//       escort follow. Driving the boost off "how far behind the human in
+			//       flow" makes a trailing bot genuinely sprint to catch up and keep the
+			//       pace of a fast human, instead of ambling along one boost tier down.
+			local nearD = GxLdBot.Settings.RubberBandNearDist;
+			local farD = GxLdBot.Settings.RubberBandFarDist;
+			local t = 0.0;
+			if (farD > nearD) {
+				local d = GxLdBot.BotCentroidDispersion(bot);
+				if (d > nearD) {
+					local td = (d - nearD) / (farD - nearD);
+					if (td > t) { t = td; }
+				}
+			}
+			// (b) flow-deficit driver: how far behind the human this bot is, in flow.
+			if (("HumanMaxFlow" in GxLdBot) && ("GetFlowFor" in GxLdBot)) {
+				local hf = GxLdBot.HumanMaxFlow();
+				local bfv = null;
+				try { bfv = GxLdBot.GetFlowFor(bot.GetOrigin()); } catch (efb) {}
+				if (hf != null && bfv != null) {
+					local deficit = hf - bfv;
+					local nearF = ("RubberBandFlowNear" in GxLdBot.Settings)
+						? GxLdBot.Settings.RubberBandFlowNear : 350.0;
+					local farF = ("RubberBandFlowFar" in GxLdBot.Settings)
+						? GxLdBot.Settings.RubberBandFlowFar : 1200.0;
+					if (deficit > nearF && farF > nearF) {
+						local tf = (deficit - nearF) / (farF - nearF);
+						if (tf > t) { t = tf; }
+					}
+				}
+			}
+			if (t <= 0.0) {
+				GxLdBot.ReleaseMovementBoost(bot, "rubberband_rejoined");
+				return;
+			}
+			if (t > 1.0) { t = 1.0; }
+			local target = 1.0 + t * (GxLdBot.Settings.RubberBandMaxSpeed - 1.0);
+			if (target > 1.0) { GxLdBot.LeaseMovementBoost(bot, target); }
+		});
+	} else if (("ReleaseAllMovementBoosts" in GxLdBot)) {
+		GxLdBot.ReleaseAllMovementBoosts("rubberband_driver_missing");
+	}
+
 	if (!GxLdBot.Settings.EnableCards) {
 		return;
 	}
-	local now = GxLdBot.Now();
-	local changed = false;
 	GxLdBot.ForEachSurvivorBot(function(bot) {
 		local idx = bot.GetEntityIndex();
 		GxLdBot.EnsureCard(idx);
-		if (!(idx in GxLdBot.Cards)) {
-			return;
-		}
-
-		// Movespeed each tick = max(card speed, rubber-band speed). We only write
-		// m_flLaggedMovementValue when the target differs from the current value, so
-		// a bot at normal speed (no card, near the squad) is never touched and keeps
-		// vanilla speed + slowdowns. Rubber-band (DESIGN 10 #1/#3): a bot far from the
-		// squad centroid speeds up to rejoin instead of trailing and getting swarmed.
-		local target = 1.0;
-		if ("SpeedBots" in GxLdBot && idx in GxLdBot.SpeedBots) {
-			target = GxLdBot.SpeedBots[idx];
-		}
-		if (("RubberBandEnable" in GxLdBot.Settings) && GxLdBot.Settings.RubberBandEnable &&
-				("BotCentroidDispersion" in GxLdBot)) {
-			local d = GxLdBot.BotCentroidDispersion(bot);
-			local nearD = GxLdBot.Settings.RubberBandNearDist;
-			local farD = GxLdBot.Settings.RubberBandFarDist;
-			if (d > nearD && farD > nearD) {
-				local t = (d - nearD) / (farD - nearD);
-				if (t > 1.0) { t = 1.0; }
-				local rb = 1.0 + t * (GxLdBot.Settings.RubberBandMaxSpeed - 1.0);
-				if (rb > target) { target = rb; }
-			}
-		}
-		try {
-			local cur = NetProps.GetPropFloat(bot, "m_flLaggedMovementValue");
-			if (cur < target - 0.01 || cur > target + 0.01) {
-				NetProps.SetPropFloat(bot, "m_flLaggedMovementValue", target);
-			}
-		} catch (e) {}
-
-		local entry = GxLdBot.Cards[idx];
-		if (!("nextRoll" in entry) || now < entry.nextRoll) {
-			return;
-		}
-		entry.nextRoll = now + GxLdBot.Settings.CardRerollInterval;
-		if (GxLdBot.RandInt(1, 100) <= GxLdBot.Settings.CardRerollChance) {
-			GxLdBot.AssignCard(idx, "timed", true);
-			changed = true;
-		}
 	});
-	if (changed && "AssignRoles" in GxLdBot) {
-		GxLdBot.AssignRoles();
-	}
 }
 
 function GxLdBot::PrintCards(player) {
@@ -422,14 +505,7 @@ function GxLdBot::PrintCards(player) {
 			return;
 		}
 		local card = GxLdBot.EnsureCard(idx);
-		local nextText = "off";
-		if (idx in GxLdBot.Cards && "nextRoll" in GxLdBot.Cards[idx]) {
-			local remain = GxLdBot.Cards[idx].nextRoll - GxLdBot.Now();
-			if (remain < 0) {
-				remain = 0;
-			}
-			nextText = remain.tointeger() + "s";
-		}
+		local nextText = "next chapter";
 		local cardName = (card != null) ? card.name : "None";
 		local cardDesc = (card != null && "desc" in card) ? card.desc : "";
 		local rarity = (card != null && "rarity" in card) ? card.rarity : "common";

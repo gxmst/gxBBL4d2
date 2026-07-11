@@ -22,6 +22,24 @@
 //   NavMesh.GetNavAreasInRadius(o,r,t) aiupdatehandler.nut:2420
 //   area.GetCenter() / area.IsBlocked  aiupdatehandler.nut:2429-2430
 
+// ---- CRASH BLACK BOX (diagnostic, temporary) --------------------------------
+// The player reports occasional hard crashes at specific map nodes. minidumps
+// have no symbols so we can't read the native stack. Instead we mark the moment
+// right before each native NavMesh call that runs every frame, flushing a single
+// line to disk immediately. If the engine crashes INSIDE one of these native
+// calls, Squirrel try/catch cannot catch it — but the last line left in
+// gxldbot/blackbox.txt names exactly which call was in flight. Remove once the
+// crash source is identified. Gated by BlackBoxEnable so it's zero-cost when off.
+function GxLdBot::BlackBox(tag) {
+	if (!("BlackBoxEnable" in GxLdBot.Settings) || !GxLdBot.Settings.BlackBoxEnable) {
+		return;
+	}
+	try {
+		StringToFile("gxldbot/blackbox.txt",
+			GxLdBot.Now().tostring() + " " + tag + "\n");
+	} catch (e) {}
+}
+
 // Flow distance of a world position, or null if this map has no usable flow
 // (finales / survival arenas are flat) so auto-progress simply disables there.
 function GxLdBot::GetFlowFor(pos) {
@@ -74,6 +92,29 @@ function GxLdBot::HumanMaxFlow() {
 		}
 	});
 	return best;
+}
+
+// Lowest flow among ALL alive survivors (bots included) — i.e. how far the most
+// straggling team member has progressed. Used by the regroup clamp: on slow
+// terrain (swamp mud) the rear falls behind because everyone's absolute speed is
+// throttled by the engine while the point keeps pushing on flow; comparing the
+// lead against this min tells us the squad is stretched so the point should ease
+// off and let the straggler close the gap. Flow-based, so it stays correct on
+// slow terrain (a lagging bot's flow simply climbs slower) without depending on
+// any speed NetProp. Returns null when no flow is available (finale/survival).
+function GxLdBot::TeamMinFlow() {
+	local worst = null;
+	GxLdBot.ForEachSurvivor(function(s) {
+		if (!GxLdBot.IsAlive(s)) {
+			return;
+		}
+		local f = null;
+		try { f = GxLdBot.GetFlowFor(s.GetOrigin()); } catch (e) {}
+		if (f != null && (worst == null || f < worst)) {
+			worst = f;
+		}
+	});
+	return worst;
 }
 
 // How far ahead (in flow units) this bot is allowed to push, from its role's
@@ -150,10 +191,71 @@ function GxLdBot::BestForwardAreaScan(bot, botFlow, targetFlow) {
 		local score = (f - botFlow) - (dist * 0.08);
 		if (score > bestScore) {
 			bestScore = score;
-			best = spot;
+			best = { area = area, pos = spot, flow = f,
+				parentArea = null, source = "scan" };
 		}
 	}
 	return best;
+}
+
+// Validate a fidget hold-shift point before we command a bot to it. The guide/
+// fidget code generates a small random XY offset off the arrival spot; on maps
+// with railings, ledges, doorways or one-way drops that raw point can land in a
+// wall, off-mesh, over a cliff edge, or in acid/fire — CommandABot then
+// micro-paths, jitters, or walks the point somewhere bad.
+//
+// HONEST SCOPE (per review): this is a HEURISTIC, not a proof. We accept the
+// point only if there is a nav area whose center is very close to it (tight
+// radius), on roughly the same floor (small Z band), not blocked, and not
+// damaging. It does NOT prove the raw point lies inside that area, nor that the
+// straight line base->point is walkable (no railing/thin-wall between). It
+// meaningfully cuts the off-mesh / cliff / acid cases vs feeding the raw random
+// point, and the offset is tiny (<=FidgetRadius) so the residual risk is small,
+// but it is not a hard guarantee. Returns true if safe enough to use; false
+// means "skip this fidget, hold the base spot".
+function GxLdBot::FidgetPointSafe(pos, baseZ) {
+	if (pos == null) {
+		return false;
+	}
+	local areas = {};
+	GxLdBot.BlackBox("fidget.GetNavAreasInRadius BEFORE");
+	try {
+		// Tight radius: we want a nav area essentially UNDER the point, not just
+		// "somewhere nearby" (a loose radius would accept a point across a railing
+		// gap). Smaller than a nav grid step so a match implies the point is
+		// approximately on-mesh, not merely near a distinct neighboring area.
+		NavMesh.GetNavAreasInRadius(pos, 25.0, areas);
+	} catch (e) {
+		return false; // API unavailable / threw — fail closed, don't fidget
+	}
+	GxLdBot.BlackBox("fidget.GetNavAreasInRadius AFTER");
+	local ok = false;
+	foreach (area in areas) {
+		if (area == null) { continue; }
+		try {
+			if (("IsBlocked" in area) && (area.IsBlocked(2, false) || area.IsBlocked(2, true))) {
+				continue;
+			}
+		} catch (eb) {}
+		// Reject damaging areas (acid/fire): a fidget must never step the point into
+		// a hazard just to look alive.
+		try {
+			if (!("IsDamaging" in area) || area.IsDamaging()) {
+				continue;
+			}
+		} catch (ed) { continue; }
+		local ctr = null;
+		try { ctr = area.GetCenter(); } catch (ec) { continue; }
+		if (ctr == null) { continue; }
+		// Same-floor guard: reject areas whose center is far above/below the base
+		// hold spot, so a fidget never steps onto a ledge above or a drop below.
+		local dz = ctr.z - baseZ;
+		if (dz < 0.0) { dz = -dz; }
+		if (dz > 45.0) { continue; }
+		ok = true;
+		break;
+	}
+	return ok;
 }
 
 // Collect all nav areas adjacent to `area` across all 4 directions into `out`
@@ -207,7 +309,7 @@ function GxLdBot::BestForwardArea(bot, botFlow, targetFlow) {
 
 	local current = startArea;
 	local currentFlow = botFlow;
-	local best = null;        // furthest acceptable spot found so far
+	local best = null;        // furthest acceptable area record found so far
 	// visited is keyed by area GetID() (integer) — NOT the area instance. Native
 	// instance handles are not reliable table keys in Squirrel (the reference mod
 	// always keys nav areas by GetID), so we do the same to avoid a silent
@@ -258,13 +360,15 @@ function GxLdBot::BestForwardArea(bot, botFlow, targetFlow) {
 		}
 
 		// Accept this hop.
+		local parentArea = current;
 		visited[bestNextId] <- true;
 		current = bestNext;
 		currentFlow = bestNextFlow;
 		hopsFound++;
 		// Only treat it as a usable target once it's meaningfully ahead of the bot.
 		if (bestNextFlow > botFlow + minGain) {
-			best = bestNextSpot;
+			best = { area = bestNext, pos = bestNextSpot, flow = bestNextFlow,
+				parentArea = parentArea, source = "gradient" };
 		}
 	}
 
@@ -275,6 +379,187 @@ function GxLdBot::BestForwardArea(bot, botFlow, targetFlow) {
 		return GxLdBot.BestForwardAreaScan(bot, botFlow, targetFlow);
 	}
 	return best;
+}
+
+function GxLdBot::ReversePathAreaToHuman(candidateArea, human, label = "candidate", budgetOwned = false) {
+	if (!GxLdBot.Settings.ReversePathEnable || candidateArea == null ||
+			human == null || !GxLdBot.IsValidEntity(human)) {
+		return false;
+	}
+	local humanArea = null;
+	try { humanArea = human.GetLastKnownArea(); } catch (e) {}
+	if (humanArea == null) { return false; }
+	local candidateId = -1;
+	local humanId = -1;
+	try { candidateId = candidateArea.GetID(); humanId = humanArea.GetID(); } catch (eid) { return false; }
+	local key = candidateId + ">" + humanId;
+	local now = GxLdBot.Now();
+	if (key in GxLdBot.ReversePathCache) {
+		local cached = GxLdBot.ReversePathCache[key];
+		if ((now - cached.at) < GxLdBot.Settings.ReversePathCacheSeconds) { return cached.ok; }
+	}
+	// A cache miss means we are about to run NavAreaBuildPath — a heavy query.
+	// budgetOwned=true means the CALLER already claimed this tick's heavy slice for
+	// the very operation this path-check belongs to (the fresh BestForwardArea scan
+	// that just claimed a HeavySliceCount slot): the reverse-path validation of that freshly
+	// computed target is part of the SAME work unit, so we must NOT fail it closed —
+	// doing so would reject every fresh far target and cap the point at
+	// UnprovenForwardMaxDistance forever. Only a STANDALONE reverse-path (cached
+	// target re-check, guide/escort leash) is heavy work of its own: for those,
+	// budgetOwned=false and we gate — if the slice is spent, fail CLOSED (hold this
+	// tick, the next free tick runs it). This closes the leak GPT flagged without
+	// breaking the far-lead handfeel.
+	if (!budgetOwned) {
+		local sliceMax = ("HeavySliceMax" in GxLdBot.Settings) ? GxLdBot.Settings.HeavySliceMax : 3;
+		if (("HeavySliceCount" in GxLdBot) && GxLdBot.HeavySliceCount >= sliceMax) {
+			// THREE-STATE: no heavy budget this tick, so we did NOT run the path build.
+			// Return null ("unknown"), NOT false ("proven unreachable"). Callers that
+			// PUSH FORWARD treat null as reject (fail-closed, correct). Callers that
+			// PULL A POINT BACK must treat null as "don't retract this tick" — collapsing
+			// no-budget into false is what let escort yank a far point home merely because
+			// we were out of budget that tick (the periodic-retract regression).
+			return null;
+		}
+		GxLdBot.HeavySliceCount = ("HeavySliceCount" in GxLdBot) ? GxLdBot.HeavySliceCount + 1 : 1;
+	}
+	local ok = false;
+	GxLdBot.ReversePathStats.calls++;
+	// BLACK BOX (crash diagnosis): NavAreaBuildPath is a native engine call; if it
+	// faults on a specific map's nav geometry, a Squirrel try/catch CANNOT catch it
+	// (the process dies inside the engine). We stamp a marker to a file that is
+	// flushed to disk BEFORE the call. After a crash, if blackbox.txt's last line is
+	// this "navpath:before" marker with no matching "after", this call is the crash
+	// site — the smoking gun a symbol-less minidump can't give us.
+	GxLdBot.BlackBox("navpath:before c=" + candidateId + " h=" + humanId + " len=" +
+		GxLdBot.Settings.ReversePathMaxLength);
+	try {
+		ok = NavMesh.NavAreaBuildPath(candidateArea, humanArea, human.GetOrigin(),
+			GxLdBot.Settings.ReversePathMaxLength, 2, false);
+		GxLdBot.BlackBox("navpath:after ok=" + ok);
+		if (ok) { GxLdBot.ReversePathStats.ok++; }
+		else { GxLdBot.ReversePathStats.rejected++; }
+	} catch (e2) {
+		GxLdBot.ReversePathStats.errors++;
+		GxLdBot.Log("reverse_path " + label + " failed: " + e2, true);
+		ok = false;
+	}
+	GxLdBot.SetTableSlot(GxLdBot.ReversePathCache, key, { ok = ok, at = now });
+	if (GxLdBot.Settings.ReversePathProbeDebug) {
+		GxLdBot.Log("reverse_path " + label + " " + candidateId + "->" + humanId + " ok=" + ok, true);
+	}
+	return ok;
+}
+
+function GxLdBot::CurrentPositionReversePathSafe(bot, human) {
+	if (!GxLdBot.IsValidEntity(bot)) { return false; }
+	local area = null;
+	try { area = bot.GetLastKnownArea(); } catch (e) {}
+	return GxLdBot.ReversePathAreaToHuman(area, human, "current");
+}
+
+// Fixed-order Safety Gate for optional forward movement. A nearby gradient
+// candidate may use the conservative envelope; a farther candidate must prove a
+// candidate->human reverse path. Unknown path state always fails closed.
+function GxLdBot::ProgressCandidateSafe(bot, candidate, human, formationSlot, budgetOwned = false) {
+	if (!GxLdBot.IsValidEntity(bot) || candidate == null ||
+			typeof candidate != "table" || !("pos" in candidate) || candidate.pos == null) {
+		return false;
+	}
+	// Candidate SELF-safety (source / area exists / not blocked / not damaging) is
+	// intrinsic to the point and must run whether or not a human is alive. Only the
+	// human-connectivity checks below (reverse path, support link, claim) are gated
+	// on having a human. Previously an early `human==null -> return true` skipped ALL
+	// of these, so an all-bot game / dead-human single-player could accept a
+	// radius-scan candidate sitting in a damaging/off-mesh area (GPT P1#2).
+	if (("source" in candidate) && candidate.source != "gradient") {
+		return false; // radius scan cannot prove connectivity on third-party maps
+	}
+	if (!("area" in candidate) || candidate.area == null) {
+		return false;
+	}
+	try {
+		if (!("IsBlocked" in candidate.area) ||
+				candidate.area.IsBlocked(2, false) || candidate.area.IsBlocked(2, true)) {
+			return false;
+		}
+	} catch (e) { return false; }
+	try {
+		if (!("IsDamaging" in candidate.area) || candidate.area.IsDamaging()) {
+			return false;
+		}
+	} catch (e2) { return false; }
+
+	// No alive human: candidate self-safety passed above; the human-connectivity
+	// gates (reverse path / support link / claim) are N/A, so accept (preserves
+	// all-bot self-complete behavior without skipping intrinsic safety).
+	if (human == null || !GxLdBot.IsValidEntity(human)) {
+		return true;
+	}
+
+	if (formationSlot == "point") {
+		try {
+			local leadDistance = (candidate.pos - human.GetOrigin()).Length();
+			if (leadDistance > GxLdBot.Settings.ReversePathMaxLeadDistance) {
+				return false;
+			}
+			if (leadDistance > GxLdBot.Settings.UnprovenForwardMaxDistance) {
+				if (!GxLdBot.ReversePathAreaToHuman(candidate.area, human, "forward", budgetOwned)) {
+					return false;
+				}
+			} else {
+				local drop = bot.GetOrigin().z - candidate.pos.z;
+				if (drop > GxLdBot.Settings.UnprovenForwardMaxDrop) { return false; }
+			}
+		} catch (e3) { return false; }
+	}
+
+	local targetFlow = ("flow" in candidate) ? candidate.flow : GxLdBot.GetFlowFor(candidate.pos);
+	if (("TargetHasHumanSupport" in GxLdBot) &&
+			!GxLdBot.TargetHasHumanSupport(bot, candidate.pos, targetFlow)) {
+		return false;
+	}
+	local claimKey = (formationSlot == "point") ? "advance:point" :
+		((formationSlot == "relay") ? "formation:relay" : null);
+	if (claimKey != null && GxLdBot.Settings.EnableClaims) {
+		if (!(claimKey in GxLdBot.Claims) ||
+				GxLdBot.Claims[claimKey].owner != bot.GetEntityIndex() ||
+				(GxLdBot.Now() - GxLdBot.Claims[claimKey].time) >= GxLdBot.Settings.ClaimExpiry) {
+			return false;
+		}
+	}
+	return true;
+}
+
+function GxLdBot::FormationHoldIntent(bot, formationSlot, human, humanFlow, botFlow, combatSev) {
+	if (human == null || humanFlow == null || botFlow == null ||
+			humanFlow >= botFlow || combatSev >= 2) {
+		return null;
+	}
+	local origin = null;
+	try { origin = bot.GetOrigin(); } catch (e) { return null; }
+	if (("TargetHasHumanSupport" in GxLdBot) &&
+			!GxLdBot.TargetHasHumanSupport(bot, origin, botFlow)) {
+		return null;
+	}
+	if (formationSlot == "point") {
+		local d = GxLdBot.DistanceBetween(bot, human);
+		// Three-state reverse path (same rule as the guide-hold in ProgressIntentFor
+		// and the escort leash): != false means "proven reachable OR not checked this
+		// tick (no budget)" — either way HOLD the forward spot. Only a proven-false
+		// (genuinely unreachable) result denies the far guide-hold. A bare truthiness
+		// test here would treat the no-budget null as unreachable and drop a
+		// legitimately-far point out of guide-hold into escort's retract (the P1#1
+		// regression, second occurrence).
+		if (d <= GxLdBot.Settings.UnprovenForwardMaxDistance ||
+				(d <= GxLdBot.Settings.ReversePathMaxLeadDistance &&
+				GxLdBot.CurrentPositionReversePathSafe(bot, human) != false)) {
+			return { guide = true, human = human };
+		}
+	}
+	if (formationSlot == "relay") {
+		return { relayHold = true, human = human };
+	}
+	return null;
 }
 
 // Decision only: the world position this bot should advance toward to push the
@@ -294,14 +579,26 @@ function GxLdBot::ProgressIntentFor(bot) {
 	if (hasHuman && !GxLdBot.TeamHasLeftSafeArea()) {
 		return null; // don't bolt the start saferoom before the human moves
 	}
-	if (("TeamUnderStress" in GxLdBot) && GxLdBot.TeamUnderStress()) {
-		return null; // someone pinned — hold, don't wander off
+	if (("BotAllowsProgress" in GxLdBot) && !GxLdBot.BotAllowsProgress(bot)) {
+		return null;
 	}
 
 	local profile = GxLdBot.GetProfile(bot);
 	if (profile == null) {
 		return null;
 	}
+	local formationSlot = ("FormationSlotFor" in GxLdBot)
+		? GxLdBot.FormationSlotFor(bot) : ((profile.role == "point") ? "point" : "none");
+	local isPoint = formationSlot == "point";
+	local isRelay = formationSlot == "relay";
+	// A human-led buddy formation has exactly one autonomous point and one relay.
+	// Rear/flex stay on vanilla/escort instead of independently acquiring the same
+	// progress target and turning the squad into a synchronized forward swarm.
+	if (hasHuman && !isPoint && !isRelay) {
+		return null;
+	}
+	if (isPoint && !GxLdBot.TryClaim("advance:point", bot)) { return null; }
+	if (isRelay && !GxLdBot.TryClaim("formation:relay", bot)) { return null; }
 	if (hasHuman && GxLdBot.BotInStartArea(bot)) {
 		return null;
 	}
@@ -317,13 +614,42 @@ function GxLdBot::ProgressIntentFor(bot) {
 	local human = GxLdBot.NearestHuman(bot);
 	local humanFlow = GxLdBot.HumanMaxFlow();
 	local baseFlow = (humanFlow != null) ? humanFlow : botFlow;
-	local targetFlow = baseFlow + GxLdBot.LeadFlowFor(profile);
+	local targetFlow = baseFlow;
 	local now = GxLdBot.Now();
+	if (isPoint && (bot.GetEntityIndex() in GxLdBot.GuideCooldownUntil) &&
+			now < GxLdBot.GuideCooldownUntil[bot.GetEntityIndex()]) {
+		return null;
+	}
 
-	// Only forward-pressure roles (point/flanker) probe ahead of a parked human;
-	// anchor/follower stay tethered so we never pull an unsupportable bot off the
-	// front (DESIGN 6.1 / 5.4 防孤立).
-	local isScout = ("IsScoutRole" in GxLdBot) && GxLdBot.IsScoutRole(profile);
+	if (isRelay) {
+		// Relay owns a real second lead. Base it on the point's proactive budget as
+		// well as its current position, so both leaders start moving together instead
+		// of the relay waiting to chase the point's heels.
+		if (humanFlow == null || !("FormationEntityFor" in GxLdBot)) {
+			return null;
+		}
+		local point = GxLdBot.FormationEntityFor("point");
+		if (point == null || point == bot) {
+			return null;
+		}
+		local pointFlow = null;
+		try { pointFlow = GxLdBot.GetFlowFor(point.GetOrigin()); } catch (ep) {}
+		if (pointFlow == null) {
+			return null;
+		}
+		local pointLead = pointFlow - humanFlow;
+		local pointProfile = GxLdBot.GetProfile(point);
+		if (pointProfile != null) {
+			local plannedLead = GxLdBot.LeadFlowFor(pointProfile) + GxLdBot.Settings.ScoutLeadFlow;
+			if (plannedLead > pointLead) { pointLead = plannedLead; }
+		}
+		if (pointLead <= GxLdBot.Settings.ProgressMinAdvanceFlow) { return null; }
+		local frac = GxLdBot.Settings.RelayFlowFraction;
+		targetFlow = humanFlow + (pointLead * frac);
+	} else {
+		// Only the point owns the personality/card lead and proactive scout budget.
+		targetFlow = baseFlow + GxLdBot.LeadFlowFor(profile) + GxLdBot.Settings.ScoutLeadFlow;
+	}
 
 	// DYNAMIC ADVANCE (player request "few zombies -> push faster, many -> slow but
 	// don't stop"). Grade the combat around this scout: 0 clear, 1 light (commons
@@ -332,29 +658,23 @@ function GxLdBot::ProgressIntentFor(bot) {
 	// but shrinks the forward lead so it presses on cautiously instead of halting
 	// for a couple of trash commons.
 	local combatSev = 0;
-	if (("ScoutCombatSeverity" in GxLdBot)) {
+	if ("GetSituation" in GxLdBot) {
+		local frame = GxLdBot.GetSituation();
+		if (frame.specialEvidence || frame.commonEvidence >= GxLdBot.Settings.DynamicHeavyCommonCount) {
+			combatSev = 2;
+		} else if (frame.commonEvidence >= GxLdBot.Settings.DynamicSlowCommonCount) {
+			combatSev = 1;
+		}
+	} else if (("ScoutCombatSeverity" in GxLdBot)) {
 		combatSev = GxLdBot.ScoutCombatSeverity(bot, human);
 	} else if (("ScoutCombatNearby" in GxLdBot) && GxLdBot.ScoutCombatNearby(bot, human)) {
 		combatSev = 2; // fail-safe: no grader -> treat any combat as a hard stop
 	}
-
-	// PROACTIVE LEAD + SCOUT FORMATION (player's "I get lost on third-party maps, I
-	// want a bot walking ahead as a guide, not waiting for me to point the way").
-	// A scout carries a constant forward lead so it stays ahead as a living
-	// breadcrumb even while you creep along. We split it by role to build a depth
-	// formation: the POINT bot is the tip-of-spear guide (full ScoutLeadFlow, walks
-	// furthest ahead — follow it and you're going the right way, flow always climbs
-	// toward the exit); the FLANKER is a mid relay (a fraction of it) so it bridges
-	// between you and the point instead of both bunching at the same distance.
-	// Anchor/follower get nothing — they stay tethered as the rear guard (防孤立铁律).
-	if (isScout) {
-		local roleLead = GxLdBot.Settings.ScoutLeadFlow;
-		if (profile.role == "flanker") {
-			local mul = ("ScoutFlankerLeadMul" in GxLdBot.Settings)
-				? GxLdBot.Settings.ScoutFlankerLeadMul : 0.5;
-			roleLead = roleLead * mul;
-		}
-		targetFlow += roleLead;
+	// AFTERMATH is a falling edge, not danger. Keep moving immediately, but reuse
+	// the light-combat lead multiplier for a brief, visibly cautious recovery.
+	if (combatSev < 1 && ("BotPerceivedPhase" in GxLdBot) &&
+			GxLdBot.BotPerceivedPhase(bot) == "AFTERMATH") {
+		combatSev = 1;
 	}
 
 	// Light combat (severity 1): keep advancing but shrink the lead so the bot
@@ -372,16 +692,57 @@ function GxLdBot::ProgressIntentFor(bot) {
 	// it straight back; we RAISE the ceiling by StallProbeExtraFlow while stalled,
 	// scout-only, so bots actually reach ahead instead of clamping to human flow.
 	local stalled = hasHuman && (now - GxLdBot.LastTeamMoveTime) >= GxLdBot.Settings.ActiveAdvanceDelay;
-	if (stalled && isScout) {
+	if (stalled && isPoint) {
 		targetFlow += GxLdBot.Settings.ActiveAdvanceFlowBoost;
 	}
-	// Cap: scouts may lead out to the raised ceiling; the centroid/dispersion
-	// backstop below is the real isolation guard, so a generous flow cap is safe.
-	if (isScout) {
+	if ("PlayerDirective" in GxLdBot && now < GxLdBot.PlayerDirective.until &&
+			humanFlow != null && isPoint) {
+		if (GxLdBot.PlayerDirective.kind == "wait") {
+			local waitCap = humanFlow + GxLdBot.Settings.PlayerWaitLeadFlow;
+			if (targetFlow > waitCap) { targetFlow = waitCap; }
+		} else if (GxLdBot.PlayerDirective.kind == "moveon") {
+			targetFlow += GxLdBot.Settings.PlayerMoveOnFlowBoost;
+		}
+	}
+	// The point may request a generous flow ceiling, but the candidate still has
+	// to pass the conservative support/distance gate below before it can move.
+	if (isPoint) {
 		local maxTarget = baseFlow + GxLdBot.Settings.ProgressMaxLeadFlow +
 			GxLdBot.Settings.StallProbeExtraFlow;
 		if (targetFlow > maxTarget) {
 			targetFlow = maxTarget;
+		}
+	}
+
+	// STRAGGLER REGROUP (player's "swamp / mud: everyone walks slow, the rear falls
+	// behind and never catches up"). Rubber-band speed boost cannot help there — mud
+	// slows via m_flLaggedMovementValue < 1.0 and the lease driver refuses to write
+	// over an engine slowdown. So instead of speeding the rear up, we hold the FRONT
+	// back: if a leader's target flow runs more than RegroupStretchFlow ahead of the
+	// MOST-behind living teammate (TeamMinFlow — includes bots, since the straggler is
+	// usually a bot), clamp the lead so the front waits for the group to close up.
+	// Past RegroupHardFlow beyond stretch, pin the leader to essentially the
+	// straggler's flow (a near-full stop) until the gap closes. Pure flow/distance
+	// logic — works regardless of which NetProp the terrain slowdown uses. Skipped
+	// while the human is the one behind (humanFlow low) is NOT desired: we anchor to
+	// the straggler whoever it is, so the squad never smears out on slow terrain.
+	if ((isPoint || isRelay) && ("TeamMinFlow" in GxLdBot)) {
+		local minFlow = GxLdBot.TeamMinFlow();
+		if (minFlow != null) {
+			local stretch = ("RegroupStretchFlow" in GxLdBot.Settings)
+				? GxLdBot.Settings.RegroupStretchFlow : 650.0;
+			local hard = ("RegroupHardFlow" in GxLdBot.Settings)
+				? GxLdBot.Settings.RegroupHardFlow : 1100.0;
+			local gap = targetFlow - minFlow;
+			if (gap > hard) {
+				// Way too stretched — wait for the group. Pin near the straggler.
+				local pinned = minFlow + stretch * 0.5;
+				if (targetFlow > pinned) { targetFlow = pinned; }
+			} else if (gap > stretch) {
+				// Moderately stretched — stop extending the lead past the stretch band.
+				local capped = minFlow + stretch;
+				if (targetFlow > capped) { targetFlow = capped; }
+			}
 		}
 	}
 
@@ -416,48 +777,43 @@ function GxLdBot::ProgressIntentFor(bot) {
 		// as you close the gap. Guarded by dispersion + no heavy combat so we never
 		// strand it. When the human passes the bot (humanFlow >= botFlow) this fails
 		// and progress re-pushes the bot ahead again.
-		if (isScout && human != null && humanFlow != null && humanFlow < botFlow
-				&& GxLdBot.BotCentroidDispersion(bot) <= GxLdBot.Settings.SquadDispersionMax
-				&& combatSev < 2) {
+		// Reverse-path here is three-state: != false means "proven reachable OR not
+		// checked this tick". Holding the forward guide spot is the LOW-risk action
+		// (the bot just stays put and faces you), so a no-budget null should keep the
+		// hold, not drop back to vanilla (which would walk it home = the retract bug).
+		// Only a proven-UNREACHABLE false falls through so escort can pull it back.
+		if (isPoint && human != null && humanFlow != null && humanFlow < botFlow
+				&& combatSev < 2
+				&& (GxLdBot.DistanceBetween(bot, human) <= GxLdBot.Settings.UnprovenForwardMaxDistance ||
+					(GxLdBot.DistanceBetween(bot, human) <= GxLdBot.Settings.ReversePathMaxLeadDistance &&
+					GxLdBot.CurrentPositionReversePathSafe(bot, human) != false))
+				&& (!("TargetHasHumanSupport" in GxLdBot) ||
+					GxLdBot.TargetHasHumanSupport(bot, origin, botFlow))) {
 			return { guide = true, human = human };
 		}
-		return null;
-	}
-
-	// Isolation backstop (DESIGN 5.4 / 6.2): if this bot is already the outlier
-	// (furthest from the squad centroid beyond SquadDispersionMax), never push it
-	// further forward — escort's 回身 check will pull it home instead. This catches
-	// "far from EVERYONE and unsupportable," which the bot-to-human leash misses
-	// when the human themselves has run off.
-	if (GxLdBot.BotCentroidDispersion(bot) > GxLdBot.Settings.SquadDispersionMax) {
+		if (isRelay && human != null && humanFlow != null && humanFlow < botFlow
+				&& combatSev < 2
+				&& (!("TargetHasHumanSupport" in GxLdBot) ||
+					GxLdBot.TargetHasHumanSupport(bot, origin, botFlow))) {
+			return { relayHold = true, human = human };
+		}
 		return null;
 	}
 
 	// Escort discipline: never push further forward if already too far from the
 	// human, or if there is combat right here.
 	if (human != null) {
-		local maxSep = GxLdBot.Settings.MaxSeparation;
+		local maxSep = isPoint ? GxLdBot.Settings.ReversePathMaxLeadDistance
+			: GxLdBot.Settings.SupportLinkDistance;
 		if ("cardMaxSeparationAdd" in profile) {
-			maxSep += profile.cardMaxSeparationAdd;
+			// Card separation may tighten the formation, but cannot widen the
+			// unproven-path safety envelope in slice 1.
+			if (profile.cardMaxSeparationAdd < 0) {
+				maxSep += profile.cardMaxSeparationAdd;
+			}
 		}
 		if (maxSep < 300.0) {
 			maxSep = 300.0;
-		}
-		// During a stall probe a scout is allowed to range further from the human
-		// (that's the point — go look ahead). The bot-to-human leash widens up to
-		// SquadDispersionMax; the centroid backstop above is the real isolation
-		// guard, so widening here can't create an unsupportable outlier.
-		// A SCOUT is allowed to range out to the guide distance at ALL times (not
-		// just during a stall), so it can walk ahead as a breadcrumb while you move
-		// too — without escort yanking it back at MaxSeparation (that yank was the
-		// "creep forward / get pulled back" shuffle). The centroid backstop above is
-		// the real isolation guard, so widening the human leash here is safe.
-		local hardCap = GxLdBot.Settings.MaxSeparation + 120.0;
-		if (isScout && GxLdBot.Settings.SquadDispersionMax > hardCap) {
-			hardCap = GxLdBot.Settings.SquadDispersionMax;
-		}
-		if (maxSep > hardCap) {
-			maxSep = hardCap;
 		}
 		if (GxLdBot.DistanceBetween(bot, human) > maxSep) {
 			return null;
@@ -478,6 +834,7 @@ function GxLdBot::ProgressIntentFor(bot) {
 	// full interval.
 	local idx = bot.GetEntityIndex();
 	local scanInterval = GxLdBot.Settings.ProgressInterval;
+	if (isRelay) { scanInterval = GxLdBot.Settings.RelayProgressInterval; }
 	if (("HumanIsMoving" in GxLdBot) && GxLdBot.HumanIsMoving()
 			&& ("ScoutMovingInterval" in GxLdBot.Settings)) {
 		scanInterval = GxLdBot.Settings.ScoutMovingInterval;
@@ -486,36 +843,75 @@ function GxLdBot::ProgressIntentFor(bot) {
 	if ((now - last) < scanInterval &&
 			(idx in GxLdBot.LastScoutTarget) && GxLdBot.LastScoutTarget[idx] != null) {
 		local cached = GxLdBot.LastScoutTarget[idx];
-		local cacheHit = false;
 		try {
 			if (("flow" in cached) && botFlow < (cached.flow - GxLdBot.Settings.ProgressFlowTolerance) &&
 					("pos" in cached) && cached.pos != null &&
-					(origin - cached.pos).Length() > GxLdBot.Settings.ProgressRetargetDistance) {
-				return cached.pos;
+					(origin - cached.pos).Length() > GxLdBot.Settings.ProgressRetargetDistance &&
+					GxLdBot.ProgressCandidateSafe(bot, cached, human, formationSlot)) {
+				GxLdBot.SetTableSlot(cached, "intentKind", isRelay ? "relay" : "progress");
+				return cached;
 			}
 		} catch (e2) {}
 		// Cache stale (arrived or flow caught up) — force rescan immediately.
 		GxLdBot.SetTableSlot(GxLdBot.LastScout, idx, -999.0);
 	}
 
+	// Cooperative per-tick work budget: cap the number of heavy ops (nav expansion
+	// + infected scan) per arbiter tick so we never spike the frame time. This used
+	// to be a SINGLE boolean slice, which meant point and relay fought over one
+	// budget and whichever lost just held — the "walk a step, stop a step" feel the
+	// player reported, because the two leaders alternated moving/holding every tick.
+	// It is now a COUNTER capped at HeavySliceMax (default 3): point AND relay can
+	// both expand nav in the same tick (continuous lead like the early version),
+	// while the cap still prevents an unbounded pile-up of heavy queries. Cached
+	// targets remain usable above without consuming budget.
+	local sliceMax = ("HeavySliceMax" in GxLdBot.Settings) ? GxLdBot.Settings.HeavySliceMax : 3;
+	if (("HeavySliceCount" in GxLdBot) && GxLdBot.HeavySliceCount >= sliceMax) {
+		return GxLdBot.FormationHoldIntent(bot, formationSlot, human,
+			humanFlow, botFlow, combatSev);
+	}
+	GxLdBot.HeavySliceCount = ("HeavySliceCount" in GxLdBot) ? GxLdBot.HeavySliceCount + 1 : 1;
 	local target = GxLdBot.BestForwardArea(bot, botFlow, targetFlow);
 	GxLdBot.SetTableSlot(GxLdBot.LastScout, idx, now);
 	if (target == null) {
 		GxLdBot.SetTableSlot(GxLdBot.LastScoutTarget, idx, null);
-		return null;
+		return GxLdBot.FormationHoldIntent(bot, formationSlot, human,
+			humanFlow, botFlow, combatSev);
 	}
-	local tflow = GxLdBot.GetFlowFor(target);
-	GxLdBot.SetTableSlot(GxLdBot.LastScoutTarget, idx,
-		{ pos = target, flow = (tflow != null) ? tflow : targetFlow });
+	if (!GxLdBot.ProgressCandidateSafe(bot, target, human, formationSlot, true)) {
+		GxLdBot.SetTableSlot(GxLdBot.LastScoutTarget, idx, null);
+		return GxLdBot.FormationHoldIntent(bot, formationSlot, human,
+			humanFlow, botFlow, combatSev);
+	}
+	if (!("flow" in target) || target.flow == null) {
+		GxLdBot.SetTableSlot(target, "flow", targetFlow);
+	}
+	GxLdBot.SetTableSlot(target, "intentKind", isRelay ? "relay" : "progress");
+	GxLdBot.SetTableSlot(GxLdBot.LastScoutTarget, idx, target);
 
 	try {
-		if ((origin - target).Length() < GxLdBot.Settings.ProgressRetargetDistance) {
-			return null; // basically already there
+		if ((origin - target.pos).Length() < GxLdBot.Settings.ProgressRetargetDistance) {
+			// The next forward nav step is very close. Only treat this as "arrived at
+			// the lead spot, hold and face the player" once the point has ESTABLISHED a
+			// real body-length lead over the human (botFlow ahead by >= LeadEstablishedFlow).
+			// If the bot is behind OR merely level with you (the "带路不积极" case: data
+			// showed bf-hf ~+56 with the point handing back to vanilla-follow), holding is
+			// wrong — FormationHoldIntent bails on a not-clearly-ahead bot and we fall back
+			// to vanilla. So keep RETURNING the nearby forward target to step out front and
+			// build the lead first; only hold once genuinely ahead.
+			local established = GxLdBot.Settings.LeadEstablishedFlow;
+			local clearlyAhead = (humanFlow != null && botFlow != null &&
+				botFlow >= humanFlow + established);
+			if (clearlyAhead) {
+				return GxLdBot.FormationHoldIntent(bot, formationSlot, human,
+					humanFlow, botFlow, combatSev);
+			}
 		}
 	} catch (e3) {}
 
 	GxLdBot.Log("progress " + profile.name + " botFlow=" + botFlow +
-		" target=" + targetFlow + " lead=" + GxLdBot.LeadFlowFor(profile));
+		" target=" + targetFlow + " slot=" + formationSlot +
+		" lead=" + GxLdBot.LeadFlowFor(profile));
 	return target;
 }
 
@@ -526,15 +922,20 @@ function GxLdBot::PrintProgress(player) {
 	GxLdBot.ForEachSurvivorBot(function(bot) {
 		any = true;
 		local profile = GxLdBot.GetProfile(bot);
+		local slot = ("FormationSlotFor" in GxLdBot)
+			? GxLdBot.FormationSlotFor(bot) : "none";
 		local bf = null;
 		try { bf = GxLdBot.GetFlowFor(bot.GetOrigin()); } catch (e) {}
 		local hf = GxLdBot.HumanMaxFlow();
 		local lead = (profile != null) ? GxLdBot.LeadFlowFor(profile) : 0.0;
 		GxLdBot.Chat(player, GxLdBot.SafeName(bot) +
-			" flow=" + ((bf != null) ? bf : "n/a") +
+			" slot=" + slot + " flow=" + ((bf != null) ? bf : "n/a") +
 			" humanFlow=" + ((hf != null) ? hf : "n/a") +
 			" lead=" + lead);
 	});
+	GxLdBot.Chat(player, "reversePath calls=" + GxLdBot.ReversePathStats.calls +
+		" ok=" + GxLdBot.ReversePathStats.ok + " reject=" +
+		GxLdBot.ReversePathStats.rejected + " errors=" + GxLdBot.ReversePathStats.errors);
 	if (!any) {
 		GxLdBot.Chat(player, "no survivor bots");
 	}
@@ -601,6 +1002,7 @@ function GxLdBot::NavProbe(player) {
 	local totalAdj = 0;
 	local bestUpFlow = baseFlow;
 	local bestDir = -1;
+	local bestUpArea = null;
 	for (local dir = 0; dir < 4; dir++) {
 		local adj = {};
 		local ok = false;
@@ -619,6 +1021,7 @@ function GxLdBot::NavProbe(player) {
 				if (f != null && (bestUpFlow == null || f > bestUpFlow)) {
 					bestUpFlow = f;
 					bestDir = dir;
+					bestUpArea = a;
 				}
 			} catch (e4) {}
 		}
@@ -635,6 +1038,42 @@ function GxLdBot::NavProbe(player) {
 			" flow, dir=" + bestDir + ") — GRADIENT ASCENT VIABLE");
 	} else {
 		GxLdBot.Chat(player, "4) adjacency works but no higher-flow neighbor here (may be at a peak/flat)");
+	}
+
+	// 5) Directional path pairs. Repeat this command with the human/bot placed on
+	// same floor, stairs, opposite sides of a drop, and opposite sides of a door.
+	local human = GxLdBot.NearestHuman(bot);
+	if (human == null) {
+		GxLdBot.Chat(player, "5) no human: reverse-path pair skipped");
+	} else {
+		local humanArea = null;
+		try { humanArea = human.GetLastKnownArea(); } catch (eh) {}
+		if (humanArea == null) {
+			GxLdBot.Chat(player, "5) NavAreaBuildPath unavailable/human off-mesh");
+		} else {
+			local botToHuman = false;
+			local humanToBot = false;
+			try {
+				botToHuman = NavMesh.NavAreaBuildPath(area, humanArea, human.GetOrigin(),
+					GxLdBot.Settings.ReversePathMaxLength, 2, false);
+				humanToBot = NavMesh.NavAreaBuildPath(humanArea, area, bot.GetOrigin(),
+					GxLdBot.Settings.ReversePathMaxLength, 2, false);
+				GxLdBot.Chat(player, "5) current pair bot->human=" + botToHuman +
+					" human->bot=" + humanToBot);
+			} catch (epath) {
+				GxLdBot.Chat(player, "5) current path pair THREW: " + epath);
+			}
+			if (bestUpArea != null) {
+				try {
+					local candidateBack = NavMesh.NavAreaBuildPath(bestUpArea, humanArea,
+						human.GetOrigin(), GxLdBot.Settings.ReversePathMaxLength, 2, false);
+					GxLdBot.Chat(player, "5) best up-flow candidate->human=" + candidateBack +
+						" flowDelta=" + (bestUpFlow - baseFlow));
+				} catch (ecandidate) {
+					GxLdBot.Chat(player, "5) candidate reverse path THREW: " + ecandidate);
+				}
+			}
+		}
 	}
 	GxLdBot.Chat(player, "==== end nav-probe ====");
 }
