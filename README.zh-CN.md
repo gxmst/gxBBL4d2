@@ -8,7 +8,7 @@ Buddy Bots for L4D2 是一个 Left 4 Dead 2 的 VScript 模组，目标是让生
 
 ## 当前状态
 
-当前版本：`1.0`
+当前版本：`1.1-dev3`
 
 首个正式版，优先面向单人 / 本地 bot 测试。它不会替换 Source 引擎底层的生还者 AI，而是在原版 bot 之上，通过 VScript、cvar、事件回调、`CommandABot` 和带保护的 NetProps 操作去做行为引导。
 
@@ -28,13 +28,15 @@ Buddy Bots for L4D2 是一个 Left 4 Dead 2 的 VScript 模组，目标是让生
 - 默认 `player` 行为模式，更像主动的开黑队友。
 - `escort` 旧版护航模式，可切回 0.6.3 风格。
 - `safe` 保守调试模式。
-- bot 角色：point、flanker、follower、anchor。
-- **双组阵型**：point + flanker 作为前锋在前方带路探路，anchor 殿后贴人保护。
+- **point / relay / rear / flex 阵型**：只有 point 决定路线，relay 跟到人和 point 之间约 70%，rear / flex 保持真人支援链。
 - **flow 梯度带路**：可用地图 nav flow 时，前锋沿流程距离往前带路；到位后停下并转身面向玩家示意“这边走”。
-- **橡皮筋移速**：离队伍越远的 bot 移动越快，掉队的能自己追回队伍，避免吊尾被围。
-- 每个 bot 有性格档案和 roguelike 风格卡牌（分普通 / 稀有 / 传说稀有度），含移速卡（Ranger / Sprinter）。
+- **反向路径安全门**：700 单位内使用保守支援链；再远必须证明 nav 能从候选点走回真人，未知或单向点一律拒绝。
+- **五阶段态势**：`SAFE / ALERT / COMBAT / EMERGENCY / AFTERMATH`，每个 bot 有自己的感知延迟、stress 和 momentum。
+- **稳定身份 + 章节 Build Card**：核心性格不再每 300 秒随机换；卡牌只调行为曲线，不再写引擎移速 NetProp。
+- **表达调度器**：一次一个发起者、最多一个延迟加入者，安全空白时会看门/物资/nav 角落、回看玩家或短暂蹲起。
+- **跨局风格记忆**：只记玩家 pace / 探索 / 常见压力，用于 slot 偏好，不拿来突破安全距离。
 - 单一动作仲裁器，统一处理移动、攻击、右键推、撤退、掩护、协助、推进、侦察、idle 和脚本救援。
-- 人类玩家被控或倒地时触发紧急防守；4 个 bot 按性格错开反应，不会同帧齐扑。
+- 紧急防守和语音都读取各 bot 的感知快照，不会同帧齐变脸。
 - 玩家移动时 bot 优先跟队同行，不会为清杂兵掉队；但自身被围时始终会还手自卫。
 - 特感控制、Tank/Witch、倒地、治疗意图等事件有语音 / 调试提示。
 - 多人保护：检测到超过一名人类玩家时休眠并恢复 cvar。
@@ -79,6 +81,13 @@ scripted_user_func hbot_mode_safe
 !hbot_roles
 !hbot_actions
 !hbot_progress_status
+!hbot_minds
+!hbot_navprobe
+!hbot_conceptprobe
+!hbot_wait
+!hbot_moveon
+!hbot_look
+!hbot_style
 !hbot_cards
 !hbot_reroll_cards
 !hbot_debug
@@ -109,7 +118,7 @@ scripted_user_func hbot_progress_status
 scripted_user_func hbot_cards
 ```
 
-`hbot_dump` 一条命令输出全部状态（版本 / 模式 / 各开关 / 每个 bot 的角色 / 当前动作 / flow 进度），调试时最方便。
+`hbot_dump` 一条命令输出全部状态（版本 / 模式 / 各开关 / 角色 / 动作 / flow / 每个 bot 的感知阶段、stress、momentum），调试时最方便。
 
 直接在 `]` 控制台输入 `!hbot_status` 报未知命令是正常的；那个位置只能运行 Source 控制台命令，聊天命令请按 Y 在聊天框输入。
 

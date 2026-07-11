@@ -6,10 +6,9 @@
 // the bot back to the vanilla engine with BOT_CMD_RESET. General combat mostly
 // stays vanilla; 0.4 adds only a narrow close-horde assist attack burst.
 //
-// Priority (high -> low):
-//   rescue > defend > retreat > cover > heal > shove > escort > assist >
-//   progress > scout > idle > (none -> reset to vanilla)
-//   Rescue is off by default in 0.6 so vanilla rescue remains the normal path.
+// SURVIVAL lane remains hard-priority: rescue > defend > retreat > cover >
+// heal > shove. TEAM / EXPRESSION candidates then compete by utility, slot and
+// short minimum holds. Rescue remains off by default so vanilla owns it.
 //
 // Enactment primitives are all verified against the shipped Advanced Bot AI mod:
 //   CommandABot cmd 0/1/2/3, m_afButtonForced shove, SnapEyeAngles aim,
@@ -21,39 +20,207 @@ if (!("ShoveCooldownUntil" in GxLdBot)) {
 
 // ---- low-level enact primitives --------------------------------------------
 
-function GxLdBot::BotAttackTarget(bot, target) {
-	if (!("CommandABot" in getroottable()) ||
-			!GxLdBot.IsValidEntity(bot) || !GxLdBot.IsValidEntity(target)) {
-		return;
+function GxLdBot::GetActuatorLease(bot) {
+	if (!GxLdBot.IsValidEntity(bot)) {
+		return null;
+	}
+	local idx = bot.GetEntityIndex();
+	if (!(idx in GxLdBot.ActuatorLease)) {
+		GxLdBot.ActuatorLease[idx] <- {
+			commandOwned = false,
+			commandKind = "none",
+			forcedBits = 0,
+			speedOwned = false,
+			speedValue = 1.0,
+			updatedAt = GxLdBot.Now()
+		};
+	}
+	local lease = GxLdBot.ActuatorLease[idx];
+	// Hot reload/back-compat: leases created by an older include may not yet have
+	// the speed fields, so extend them before any reader touches the slots.
+	if (!("speedOwned" in lease)) { lease.speedOwned <- false; }
+	if (!("speedValue" in lease)) { lease.speedValue <- 1.0; }
+	return lease;
+}
+
+function GxLdBot::LeaseCommand(bot, kind) {
+	local lease = GxLdBot.GetActuatorLease(bot);
+	if (lease == null) { return; }
+	lease.commandOwned = true;
+	lease.commandKind = kind;
+	lease.updatedAt = GxLdBot.Now();
+}
+
+function GxLdBot::ReleaseCommandLease(bot) {
+	if (!GxLdBot.IsValidEntity(bot)) { return; }
+	local idx = bot.GetEntityIndex();
+	if (!(idx in GxLdBot.ActuatorLease)) { return; }
+	local lease = GxLdBot.ActuatorLease[idx];
+	lease.commandOwned = false;
+	lease.commandKind = "none";
+	lease.updatedAt = GxLdBot.Now();
+}
+
+function GxLdBot::LeaseForcedBit(bot, bit) {
+	local lease = GxLdBot.GetActuatorLease(bot);
+	if (lease == null) { return; }
+	lease.forcedBits = lease.forcedBits | bit;
+	lease.updatedAt = GxLdBot.Now();
+}
+
+function GxLdBot::ReleaseForcedBit(bot, bit) {
+	if (!GxLdBot.IsValidEntity(bot)) { return; }
+	local idx = bot.GetEntityIndex();
+	if (!(idx in GxLdBot.ActuatorLease)) { return; }
+	local lease = GxLdBot.ActuatorLease[idx];
+	lease.forcedBits = lease.forcedBits & ~bit;
+	lease.updatedAt = GxLdBot.Now();
+}
+
+// Own m_flLaggedMovementValue only while gxLdBot has actually raised it. The
+// engine also uses this prop for slow effects, so the driver never writes while
+// the observed value is below 1.0 and never claims a value it did not author.
+function GxLdBot::LeaseMovementBoost(bot, target) {
+	if (!GxLdBot.IsValidEntity(bot) || target <= 1.0 ||
+			(("CanControlBots" in GxLdBot) && !GxLdBot.CanControlBots())) {
+		return false;
+	}
+	local lease = GxLdBot.GetActuatorLease(bot);
+	if (lease == null) { return false; }
+	local cur = 1.0;
+	try { cur = NetProps.GetPropFloat(bot, "m_flLaggedMovementValue"); }
+	catch (e) { return false; }
+
+	// A value below 1.0 belongs to an engine slowdown. Drop any stale ownership
+	// record and leave the value completely untouched.
+	if (cur < 0.99) {
+		lease.speedOwned = false;
+		lease.speedValue = 1.0;
+		return false;
+	}
+	if (lease.speedOwned) {
+		local authoredDelta = cur - lease.speedValue;
+		if (authoredDelta < 0.0) { authoredDelta = -authoredDelta; }
+		if (authoredDelta > 0.03) {
+			// Another system changed the prop after our write; no longer ours to restore.
+			lease.speedOwned = false;
+			lease.speedValue = 1.0;
+		}
+	}
+	// Boost path only raises. A smaller desired boost waits until the lease is
+	// released at the near threshold instead of writing downward over engine state.
+	if (cur >= target - 0.01) {
+		return lease.speedOwned;
 	}
 	try {
-		CommandABot({ cmd = 0, target = target, bot = bot });
-	} catch (e) {
-		GxLdBot.Log("BotAttackTarget failed: " + e, true);
+		NetProps.SetPropFloat(bot, "m_flLaggedMovementValue", target);
+		lease.speedOwned = true;
+		lease.speedValue = target;
+		lease.updatedAt = GxLdBot.Now();
+		return true;
+	} catch (e2) {
+		GxLdBot.Log("movement boost failed: " + e2, true);
+	}
+	return false;
+}
+
+function GxLdBot::ReleaseMovementBoost(bot, reason = "speed_release") {
+	if (!GxLdBot.IsValidEntity(bot)) { return; }
+	local idx = bot.GetEntityIndex();
+	if (!(idx in GxLdBot.ActuatorLease)) { return; }
+	local lease = GxLdBot.ActuatorLease[idx];
+	if (!("speedOwned" in lease) || !lease.speedOwned) { return; }
+	local cur = 1.0;
+	local readable = true;
+	try { cur = NetProps.GetPropFloat(bot, "m_flLaggedMovementValue"); }
+	catch (e) { readable = false; }
+	if (readable) {
+		local authoredDelta = cur - lease.speedValue;
+		if (authoredDelta < 0.0) { authoredDelta = -authoredDelta; }
+		// Restore only the exact boost we own. If the engine slowed the bot or any
+		// other system changed the value, clearing the lease is the only safe action.
+		if (cur > 1.0 && authoredDelta <= 0.03) {
+			try { NetProps.SetPropFloat(bot, "m_flLaggedMovementValue", 1.0); }
+			catch (e2) { GxLdBot.Log("movement boost release failed: " + e2, true); }
+		}
+	}
+	lease.speedOwned = false;
+	lease.speedValue = 1.0;
+	lease.updatedAt = GxLdBot.Now();
+}
+
+function GxLdBot::ReleaseAllMovementBoosts(reason = "speed_release_all") {
+	local indices = [];
+	foreach (idx, lease in GxLdBot.ActuatorLease) {
+		if (("speedOwned" in lease) && lease.speedOwned) { indices.append(idx); }
+	}
+	foreach (i, idx in indices) {
+		try {
+			local ent = EntIndexToHScript(idx);
+			if (ent != null && GxLdBot.IsValidEntity(ent)) {
+				GxLdBot.ReleaseMovementBoost(ent, reason);
+			}
+		} catch (e) {}
 	}
 }
 
+function GxLdBot::BotAttackTarget(bot, target) {
+	if (!("CommandABot" in getroottable()) ||
+			!GxLdBot.IsValidEntity(bot) || !GxLdBot.IsValidEntity(target) ||
+			(("CanControlBots" in GxLdBot) && !GxLdBot.CanControlBots())) {
+		return false;
+	}
+	local idx = bot.GetEntityIndex();
+	local targetIdx = target.GetEntityIndex();
+	local now = GxLdBot.Now();
+	if (idx in GxLdBot.LastAttack) {
+		local last = GxLdBot.LastAttack[idx];
+		if (last.targetIdx == targetIdx &&
+				(now - last.at) < GxLdBot.Settings.AttackCommandRefresh) {
+			GxLdBot.LeaseCommand(bot, "attack");
+			return true;
+		}
+	}
+	try {
+		CommandABot({ cmd = 0, target = target, bot = bot });
+		GxLdBot.SetTableSlot(GxLdBot.LastAttack, idx, { targetIdx = targetIdx, at = now });
+		GxLdBot.LeaseCommand(bot, "attack");
+		return true;
+	} catch (e) {
+		GxLdBot.Log("BotAttackTarget failed: " + e, true);
+	}
+	return false;
+}
+
 function GxLdBot::BotMoveTo(bot, pos) {
-	if (!("CommandABot" in getroottable()) || !GxLdBot.IsValidEntity(bot) || pos == null) {
-		return;
+	if (!("CommandABot" in getroottable()) || !GxLdBot.IsValidEntity(bot) || pos == null ||
+			(("CanControlBots" in GxLdBot) && !GxLdBot.CanControlBots())) {
+		return false;
 	}
 	try {
 		CommandABot({ cmd = 1, pos = pos, bot = bot });
+		GxLdBot.LeaseCommand(bot, "move");
+		return true;
 	} catch (e) {
 		GxLdBot.Log("BotMoveTo failed: " + e, true);
 	}
+	return false;
 }
 
 function GxLdBot::BotRetreatFrom(bot, threat) {
 	if (!("CommandABot" in getroottable()) ||
-			!GxLdBot.IsValidEntity(bot) || !GxLdBot.IsValidEntity(threat)) {
-		return;
+			!GxLdBot.IsValidEntity(bot) || !GxLdBot.IsValidEntity(threat) ||
+			(("CanControlBots" in GxLdBot) && !GxLdBot.CanControlBots())) {
+		return false;
 	}
 	try {
 		CommandABot({ cmd = 2, target = threat, bot = bot });
+		GxLdBot.LeaseCommand(bot, "retreat");
+		return true;
 	} catch (e) {
 		GxLdBot.Log("BotRetreatFrom failed: " + e, true);
 	}
+	return false;
 }
 
 // Hand a bot back to the engine's own AI: BOT_CMD_RESET (3) cancels any move /
@@ -61,14 +228,19 @@ function GxLdBot::BotRetreatFrom(bot, threat) {
 // a bot is never left executing a stale command.
 function GxLdBot::BotResetCommand(bot) {
 	if (!("CommandABot" in getroottable()) || !GxLdBot.IsValidEntity(bot)) {
-		return;
+		return false;
 	}
 	try {
 		CommandABot({ cmd = 3, bot = bot });
+		local idx = bot.GetEntityIndex();
+		if (idx in GxLdBot.LastAttack) { delete GxLdBot.LastAttack[idx]; }
+		GxLdBot.ReleaseCommandLease(bot);
 		GxLdBot.Log("reset " + GxLdBot.SafeName(bot));
+		return true;
 	} catch (e) {
 		GxLdBot.Log("BotResetCommand failed: " + e, true);
 	}
+	return false;
 }
 
 // Snap a bot's aim toward a target. Used only as a single nudge right before a
@@ -76,8 +248,9 @@ function GxLdBot::BotResetCommand(bot) {
 // is the "superhuman aim" the design avoids). Mirrors the reference's QAngle
 // math (ai_utils.nut CreateQAngle).
 function GxLdBot::FaceEntity(bot, target) {
-	if (!GxLdBot.IsValidEntity(bot) || !GxLdBot.IsValidEntity(target)) {
-		return;
+	if (!GxLdBot.IsValidEntity(bot) || !GxLdBot.IsValidEntity(target) ||
+			(("CanControlBots" in GxLdBot) && !GxLdBot.CanControlBots())) {
+		return false;
 	}
 	try {
 		local d = target.GetOrigin() - bot.EyePosition();
@@ -85,9 +258,25 @@ function GxLdBot::FaceEntity(bot, target) {
 		local flat = sqrt(d.x * d.x + d.y * d.y);
 		local pitch = atan2(-d.z, flat) * 180.0 / PI;
 		bot.SnapEyeAngles(QAngle(pitch, yaw, 0));
+		return true;
 	} catch (e) {
 		GxLdBot.Log("FaceEntity failed: " + e, true);
 	}
+	return false;
+}
+
+function GxLdBot::FacePosition(bot, pos) {
+	if (!GxLdBot.IsValidEntity(bot) || pos == null ||
+			(("CanControlBots" in GxLdBot) && !GxLdBot.CanControlBots())) { return false; }
+	try {
+		local d = pos - bot.EyePosition();
+		local yaw = atan2(d.y, d.x) * 180.0 / PI;
+		local flat = sqrt(d.x * d.x + d.y * d.y);
+		local pitch = atan2(-d.z, flat) * 180.0 / PI;
+		bot.SnapEyeAngles(QAngle(pitch, yaw, 0));
+		return true;
+	} catch (e) { GxLdBot.Log("FacePosition failed: " + e, true); }
+	return false;
 }
 
 // Hold the shove button so the bot shoves a special off a pinned teammate. We
@@ -95,8 +284,9 @@ function GxLdBot::FaceEntity(bot, target) {
 // land (matching ai-shoveinfected.nut), and face the target first. The bit is
 // cleared by ClearShove whenever the bot is not shoving, so it never sticks.
 function GxLdBot::SetShove(bot, target) {
-	if (!GxLdBot.IsValidEntity(bot)) {
-		return;
+	if (!GxLdBot.IsValidEntity(bot) ||
+			(("CanControlBots" in GxLdBot) && !GxLdBot.CanControlBots())) {
+		return false;
 	}
 	try { NetProps.SetPropInt(bot, "m_iShovePenalty", 0); } catch (e) {}
 	try {
@@ -116,9 +306,12 @@ function GxLdBot::SetShove(bot, target) {
 			NetProps.SetPropInt(bot, "m_afButtonForced", b | GxLdBot.BTN_SHOVE);
 			GxLdBot.Log("shove " + GxLdBot.SafeName(bot));
 		}
+		GxLdBot.LeaseForcedBit(bot, GxLdBot.BTN_SHOVE);
+		return true;
 	} catch (e3) {
 		GxLdBot.Log("SetShove failed: " + e3, true);
 	}
+	return false;
 }
 
 function GxLdBot::ClearShove(bot) {
@@ -131,6 +324,7 @@ function GxLdBot::ClearShove(bot) {
 			NetProps.SetPropInt(bot, "m_afButtonForced", b & ~GxLdBot.BTN_SHOVE);
 		}
 	} catch (e) {}
+	GxLdBot.ReleaseForcedBit(bot, GxLdBot.BTN_SHOVE);
 }
 
 // ---- detection helpers ------------------------------------------------------
@@ -245,6 +439,7 @@ function GxLdBot::ClearHeal(bot) {
 			NetProps.SetPropInt(bot, "m_afButtonForced", b & ~GxLdBot.BTN_USE);
 		}
 	} catch (e) {}
+	GxLdBot.ReleaseForcedBit(bot, GxLdBot.BTN_USE);
 }
 
 // Release the forced crouch bit used by the goof-off teabag. Called whenever a
@@ -260,6 +455,7 @@ function GxLdBot::ClearGoof(bot) {
 			NetProps.SetPropInt(bot, "m_afButtonForced", b & ~GxLdBot.BTN_DUCK);
 		}
 	} catch (e) {}
+	GxLdBot.ReleaseForcedBit(bot, GxLdBot.BTN_DUCK);
 }
 
 // DESIGN 6.3 goof-off: zero-physical-risk idle antics. When a bot is idling in a
@@ -306,8 +502,10 @@ function GxLdBot::GoofTick(bot, idx, human, now, maxDist = null) {
 				g.ducked = ((b & GxLdBot.BTN_DUCK) == 0);
 				if (g.ducked) {
 					NetProps.SetPropInt(bot, "m_afButtonForced", b | GxLdBot.BTN_DUCK);
+					GxLdBot.LeaseForcedBit(bot, GxLdBot.BTN_DUCK);
 				} else {
 					NetProps.SetPropInt(bot, "m_afButtonForced", b & ~GxLdBot.BTN_DUCK);
+					GxLdBot.ReleaseForcedBit(bot, GxLdBot.BTN_DUCK);
 				}
 			} catch (e) {}
 		}
@@ -407,44 +605,20 @@ function GxLdBot::CombatShoveTargetFor(bot, idx, now) {
 	local origin = null;
 	try { origin = bot.GetOrigin(); } catch (e) { return null; }
 
-	local originZ = origin.z;
-	try {
-		local p = null;
-		local best = null;
-		local bestDist = 999999.0;
-		while (p = Entities.FindByClassnameWithin(p, "player", origin,
-				GxLdBot.Settings.CombatShoveSpecialRadius)) {
-			if (NetProps.GetPropInt(p, "m_iTeamNum") == 3 && !p.IsDead()) {
-				// Same-floor only: a special one floor up can't be shoved from here.
-				if (!GxLdBot.IsSameFloor(originZ, p)) {
-					continue;
-				}
-				// Never shove a Tank: shove does nothing to it (can't be staggered by
-				// melee), so a bot flailing shove at a Tank is the "useless shoving near
-				// the Tank" bug. Leave the Tank to gunfire (vanilla / assist).
-				if (("IsTank" in GxLdBot) && GxLdBot.IsTank(p)) {
-					continue;
-				}
-				local d = (p.GetOrigin() - origin).Length();
-				if (d < bestDist) {
-					best = p;
-					bestDist = d;
-				}
-			}
-		}
-		if (best != null) {
-			return best;
-		}
-	} catch (e2) {}
+	local record = GxLdBot.ThreatRecordFor(bot);
+	if (record == null) { return null; }
+	local special = GxLdBot.ThreatListTarget(record.specials,
+		GxLdBot.Settings.CombatShoveSpecialRadius, 1);
+	if (special != null && !("IsTank" in GxLdBot && GxLdBot.IsTank(special.ent))) {
+		return special.ent;
+	}
 
 	// Commons: only shove when actually swarmed by REACHABLE commons. A lone common
 	// is shot (vanilla), not shoved. Same-floor filtering is THE fix for "bot shoves
 	// empty air" — the sphere test used to count zombies a floor above/below.
-	local commons = GxLdBot.CountReachableCommons(origin, GxLdBot.Settings.CombatShoveRadius);
-	if (commons < GxLdBot.Settings.CombatShoveCommonCount) {
-		return null;
-	}
-	return GxLdBot.NearestReachableCommon(origin, GxLdBot.Settings.CombatShoveRadius);
+	local commons = GxLdBot.ThreatListTarget(record.commons,
+		GxLdBot.Settings.CombatShoveRadius, GxLdBot.Settings.CombatShoveCommonCount);
+	return (commons != null) ? commons.ent : null;
 }
 
 function GxLdBot::ReviverFor(victim) {
@@ -762,69 +936,24 @@ function GxLdBot::AssistTargetFor(bot) {
 	}
 
 	local botOrigin = null;
-	try {
-		botOrigin = bot.GetOrigin();
-	} catch (e) {
-		return null;
-	}
-
-	local botZ = botOrigin.z;
+	try { botOrigin = bot.GetOrigin(); } catch (e) { return null; }
+	local frame = GxLdBot.GetSituation();
+	if (!("threatBySurvivor" in frame)) { return null; }
 	local best = { ent = null, score = 999999.0 };
-	GxLdBot.ForEachSurvivor(function(s) {
-		if (!GxLdBot.IsAlive(s)) {
-			return;
+	foreach (sidx, record in frame.threatBySurvivor) {
+		if ((GxLdBot.Now() - record.updatedAt) > GxLdBot.Settings.ThreatRecordMaxAge) { continue; }
+		try { if ((botOrigin - record.origin).Length() > assistMax) { continue; } } catch (ed) { continue; }
+		local picked = GxLdBot.ThreatListTarget(record.specials, assistRadius, 1);
+		local bonus = 160.0;
+		if (picked == null) {
+			picked = GxLdBot.ThreatListTarget(record.commons, assistRadius, assistCount);
+			bonus = (picked != null) ? picked.count * 18.0 : 0.0;
 		}
-
-		local origin = null;
-		try {
-			origin = s.GetOrigin();
-			if ((botOrigin - origin).Length() > assistMax) {
-				return;
-			}
-		} catch (e) {
-			return;
-		}
-
-		// Special near the swarmed survivor. The radius is NOT doubled anymore
-		// (it used to be assistRadius*2 = up to 1080u, which pulled a bot off
-		// vanilla free-fire whenever any special existed halfway across the map).
-		// The special must also be on the bot's floor — no swinging at a Hunter a
-		// storey up (L4D2 sphere-test trap, see IsSameFloor).
-		local special = GxLdBot.NearestThreatNear(s, 0.0, assistRadius);
-		if (special != null && GxLdBot.IsSameFloor(botZ, special)) {
-			local spScore = 999999.0;
-			try {
-				spScore = (botOrigin - special.GetOrigin()).Length() - 160.0;
-			} catch (es) {}
-			if (spScore < best.score) {
-				best.ent = special;
-				best.score = spScore;
-			}
-			return;
-		}
-
-		// Commons: same-floor count only, so an unreachable horde one floor
-		// up/down never triggers an assist. A survivor must be genuinely swarmed
-		// (assistCount+) by reachable commons before we leave vanilla combat.
-		local commons = GxLdBot.CountReachableCommons(origin, assistRadius);
-		if (commons < assistCount) {
-			return;
-		}
-
-		local target = GxLdBot.NearestReachableCommon(origin, assistRadius);
-		if (target == null || !GxLdBot.IsSameFloor(botZ, target)) {
-			return;
-		}
-
+		if (picked == null || !GxLdBot.IsValidEntity(picked.ent)) { continue; }
 		local score = 999999.0;
-		try {
-			score = (botOrigin - target.GetOrigin()).Length() - (commons * 18.0);
-		} catch (e2) {}
-		if (score < best.score) {
-			best.ent = target;
-			best.score = score;
-		}
-	});
+		try { score = (botOrigin - picked.ent.GetOrigin()).Length() - bonus; } catch (es) {}
+		if (score < best.score) { best.ent = picked.ent; best.score = score; }
+	}
 
 	return best.ent;
 }
@@ -839,20 +968,88 @@ function GxLdBot::AssistIsSelfDefense(bot) {
 	if (!GxLdBot.IsValidEntity(bot)) {
 		return false;
 	}
-	local origin = null;
-	try { origin = bot.GetOrigin(); } catch (e) { return false; }
 	local radius = GxLdBot.Settings.AssistCommonRadius;
 	if (radius > 260.0) {
 		radius = 260.0; // self-defense = genuinely close, not map-wide
 	}
-	// A special right on top of us always counts.
-	local special = GxLdBot.NearestThreatNear(bot, 0.0, radius);
-	if (special != null && GxLdBot.IsSameFloor(origin.z, special)) {
-		return true;
+	local record = GxLdBot.ThreatRecordFor(bot);
+	if (record == null) { return false; }
+	if (GxLdBot.ThreatListTarget(record.specials, radius, 1) != null) { return true; }
+	return GxLdBot.ThreatListTarget(record.commons, radius,
+		GxLdBot.Settings.AssistSelfDefenseCount) != null;
+}
+
+function GxLdBot::SelfDefenseTargetFor(bot) {
+	local record = GxLdBot.ThreatRecordFor(bot);
+	if (record == null) { return null; }
+	local radius = GxLdBot.Settings.AssistCommonRadius;
+	if (radius > 260.0) { radius = 260.0; }
+	local picked = GxLdBot.ThreatListTarget(record.specials, radius, 1);
+	if (picked == null) {
+		picked = GxLdBot.ThreatListTarget(record.commons, radius,
+			GxLdBot.Settings.AssistSelfDefenseCount);
 	}
-	// Or a real swarm of reachable commons at close range.
-	local n = GxLdBot.CountReachableCommons(origin, radius);
-	return n >= GxLdBot.Settings.AssistSelfDefenseCount;
+	return (picked != null) ? picked.ent : null;
+}
+
+// At most one bot performs optional team assist. Prefer rear/flex so point and
+// relay keep the route readable; every bot may still self-defend independently.
+function GxLdBot::AssignTeamAssist(now) {
+	local frame = GxLdBot.GetSituation();
+	if (!GxLdBot.Settings.EnableAssist || GxLdBot.TeamModel.phase != "COMBAT") {
+		GxLdBot.TeamAssistPlan = { owner = -1, target = null, until = 0.0,
+			frameSerial = GxLdBot.WorldSerial };
+		return;
+	}
+	if (now < GxLdBot.TeamAssistPlan.until &&
+			GxLdBot.IsValidEntity(GxLdBot.TeamAssistPlan.target)) { return; }
+	local target = null;
+	local bestPressure = -1;
+	foreach (sidx, record in frame.threatBySurvivor) {
+		if ((now - record.updatedAt) > GxLdBot.Settings.ThreatRecordMaxAge) { continue; }
+		local special = GxLdBot.ThreatListTarget(record.specials,
+			GxLdBot.Settings.AssistCommonRadius, 1);
+		local commons = GxLdBot.ThreatListTarget(record.commons,
+			GxLdBot.Settings.AssistCommonRadius, GxLdBot.Settings.AssistCommonCount);
+		local pressure = (special != null) ? 1000 : ((commons != null) ? commons.count : 0);
+		local candidate = (special != null) ? special : commons;
+		if (candidate != null && pressure > bestPressure) {
+			bestPressure = pressure;
+			target = candidate.ent;
+		}
+	}
+	if (!GxLdBot.IsValidEntity(target)) {
+		GxLdBot.TeamAssistPlan = { owner = -1, target = null, until = now + 0.3,
+			frameSerial = GxLdBot.WorldSerial };
+		return;
+	}
+	local owner = -1;
+	local bestScore = 999999.0;
+	GxLdBot.ForEachSurvivorBot(function(candidateBot) {
+		if (!GxLdBot.IsAlive(candidateBot) || GxLdBot.IsUncommandable(candidateBot)) { return; }
+		local slot = GxLdBot.FormationSlotFor(candidateBot);
+		// HARD-EXCLUDE the leaders (point/relay) from optional team-assist. Data showed
+		// them spending 2.4x more time shooting trash than leading — they would win the
+		// assign whenever they happened to be closest to a common, then stand still
+		// clearing it instead of pushing the route ("原地站住打怪不往前"). Leaders keep
+		// route duty; trash-clearing is the rear/flex job. Leaders still SELF-DEFEND
+		// independently (SelfDefenseTargetFor, score 96) when swarmed at point-blank —
+		// that path does not go through this owner assignment.
+		if (slot == "point" || slot == "relay") { return; }
+		local slotCost = (slot == "rear") ? -420.0 : ((slot == "flex") ? -280.0 : 0.0);
+		local score = GxLdBot.DistanceBetween(candidateBot, target) + slotCost;
+		if (score < bestScore) { bestScore = score; owner = candidateBot.GetEntityIndex(); }
+	});
+	GxLdBot.TeamAssistPlan = { owner = owner, target = target,
+		until = now + GxLdBot.Settings.TeamAssistPlanSeconds,
+		frameSerial = GxLdBot.WorldSerial };
+}
+
+function GxLdBot::TeamAssistTargetFor(bot, now) {
+	if (!GxLdBot.IsValidEntity(bot) || now >= GxLdBot.TeamAssistPlan.until ||
+			GxLdBot.TeamAssistPlan.owner != bot.GetEntityIndex() ||
+			!GxLdBot.IsValidEntity(GxLdBot.TeamAssistPlan.target)) { return null; }
+	return GxLdBot.TeamAssistPlan.target;
 }
 
 function GxLdBot::EmergencyDefendIntentFor(bot) {
@@ -897,7 +1094,7 @@ function GxLdBot::EscortIntentFor(bot) {
 	if (human == null || !GxLdBot.IsAlive(human)) {
 		return null;
 	}
-	if (("TeamUnderStress" in GxLdBot) && GxLdBot.TeamUnderStress()) {
+	if (("BotAllowsProgress" in GxLdBot) && !GxLdBot.BotAllowsProgress(bot)) {
 		return null;
 	}
 	local threshold = GxLdBot.Settings.EscortCatchupDistance;
@@ -912,18 +1109,31 @@ function GxLdBot::EscortIntentFor(bot) {
 		threshold = GxLdBot.Settings.MaxSeparation;
 	}
 
-	// Formation widening (DESIGN 6.1/6.2/§10-#4): escort is higher priority than
-	// progress, so a fixed MaxSeparation cap yanks a scout back to the human before
-	// progress can push it ahead — that's why point/flanker used to trail BEHIND the
-	// moving human instead of leading. A scout is allowed to range out to the
-	// SquadDispersionMax leash AT ALL TIMES (not just when the human is parked), so
-	// it can stay ahead as the human advances and hold the spearhead formation. The
-	// centroid backstop below is the real isolation guard, so widening the human-leash
-	// here can never strand an unsupportable outlier.
-	local now = GxLdBot.Now();
-	local isScout = ("IsScoutRole" in GxLdBot) && GxLdBot.IsScoutRole(profile);
-	if (isScout && GxLdBot.Settings.SquadDispersionMax > threshold) {
-		threshold = GxLdBot.Settings.SquadDispersionMax;
+	// Formation-specific leash. Point/relay get enough room to hold their slots,
+	// but never the old centroid-derived 900u blanket permission. Until reverse
+	// path probing lands, their hard limits are the conservative support envelope.
+	local formationSlot = ("FormationSlotFor" in GxLdBot)
+		? GxLdBot.FormationSlotFor(bot) : "none";
+	if (formationSlot == "point") {
+		threshold = GxLdBot.Settings.UnprovenForwardMaxDistance;
+		local pointDistance = GxLdBot.DistanceBetween(bot, human);
+		if (pointDistance > threshold &&
+				pointDistance <= GxLdBot.Settings.ReversePathMaxLeadDistance &&
+				("CurrentPositionReversePathSafe" in GxLdBot)) {
+			// THREE-STATE reverse path (fixes the periodic far-point retract regression):
+			//   true  → proven reachable, widen the leash to the far cap.
+			//   null  → NOT checked this tick (no heavy budget). Do NOT retract merely
+			//           because we couldn't afford the query — widen the leash too, so a
+			//           budget-starved tick never yanks a legitimately-far point home.
+			//   false → proven UNREACHABLE. Keep the tight UnprovenForwardMaxDistance
+			//           threshold so escort pulls this genuinely-stranded point back.
+			local reach = GxLdBot.CurrentPositionReversePathSafe(bot, human);
+			if (reach != false) {
+				threshold = GxLdBot.Settings.ReversePathMaxLeadDistance;
+			}
+		}
+	} else if (formationSlot == "relay") {
+		threshold = GxLdBot.Settings.SupportLinkDistance;
 	}
 
 	local pos = null;
@@ -934,16 +1144,41 @@ function GxLdBot::EscortIntentFor(bot) {
 		return { pos = pos, human = human };
 	}
 
-	// 回身 trigger B (DESIGN 6.2/5.4): even when bot-to-human distance is fine, a
-	// bot that has become the unsupportable outlier from the squad centroid must
-	// come home. This catches the case the human leash misses — the human has run
-	// off and this bot is stranded far from EVERYONE, not just from the human.
-	if (("BotCentroidDispersion" in GxLdBot) &&
-			GxLdBot.BotCentroidDispersion(bot) > GxLdBot.Settings.SquadDispersionMax) {
-		return { pos = pos, human = human };
+	// 回身 trigger B: permission comes from the human-connected support graph,
+	// never from centroid. If this bot no longer links to that component, escort
+	// takes over immediately and pulls it home.
+	if (("TargetHasHumanSupport" in GxLdBot)) {
+		local currentFlow = null;
+		try { currentFlow = GxLdBot.GetFlowFor(bot.GetOrigin()); } catch (ef) {}
+		if (!GxLdBot.TargetHasHumanSupport(bot, bot.GetOrigin(), currentFlow)) {
+			return { pos = pos, human = human };
+		}
 	}
 
 	return null;
+}
+
+function GxLdBot::CheckBackIntentFor(bot, idx, now) {
+	if (!(idx in GxLdBot.CheckBack) || !GxLdBot.IsValidEntity(bot)) {
+		return null;
+	}
+	local state = GxLdBot.CheckBack[idx];
+	local human = GxLdBot.NearestHuman(bot);
+	if (human == null || !GxLdBot.IsAlive(human) || now >= state.until) {
+		delete GxLdBot.CheckBack[idx];
+		GxLdBot.SetTableSlot(GxLdBot.GuideCooldownUntil, idx,
+			now + GxLdBot.Settings.GuideCheckBackCooldown);
+		return null;
+	}
+	if (GxLdBot.DistanceBetween(bot, human) <= GxLdBot.Settings.GuideCheckBackStopDistance) {
+		delete GxLdBot.CheckBack[idx];
+		GxLdBot.SetTableSlot(GxLdBot.GuideCooldownUntil, idx,
+			now + GxLdBot.Settings.GuideCheckBackCooldown);
+		return null;
+	}
+	local pos = null;
+	try { pos = human.GetOrigin(); } catch (e) { return null; }
+	return { kind = "checkback", pos = pos, human = human };
 }
 
 function GxLdBot::IdleWanderPos(bot, human) {
@@ -954,14 +1189,108 @@ function GxLdBot::IdleWanderPos(bot, human) {
 	try { origin = human.GetOrigin(); } catch (e) { return null; }
 	local idx = 0;
 	try { idx = bot.GetEntityIndex(); } catch (e2) {}
-	local step = (GxLdBot.Now() / 3.0).tointeger();
-	local angle = (idx * 1.71) + (step * 2.13);
+	// Stable idle station. The old time-varying angle changed destination every
+	// three seconds and made bots orbit/backtrack around the player.
+	local angle = idx * 1.71;
 	local radius = GxLdBot.Settings.IdleWanderRadius * (0.55 + ((idx % 3) * 0.18));
 	return Vector(
 		origin.x + cos(angle) * radius,
 		origin.y + sin(angle) * radius,
 		origin.z
 	);
+}
+
+function GxLdBot::NormalizeProgressIntent(pres) {
+	if (pres == null) { return null; }
+	if (typeof pres == "table" && ("guide" in pres)) {
+		return { kind = "guide", human = pres.human };
+	}
+	if (typeof pres == "table" && ("relayHold" in pres)) {
+		return { kind = "relay_hold", human = pres.human };
+	}
+	if (typeof pres == "table" && ("pos" in pres) && pres.pos != null) {
+		local moveKind = (("intentKind" in pres) && pres.intentKind == "relay")
+			? "relay" : "progress";
+		return { kind = moveKind, pos = pres.pos, area = ("area" in pres) ? pres.area : null };
+	}
+	return { kind = "progress", pos = pres };
+}
+
+// Survival actions remain hard-priority. Team/expression actions compete by
+// utility with a short continuity bonus so threshold edges do not ping-pong.
+function GxLdBot::SelectUtilityIntent(bot, idx, now) {
+	local candidates = [];
+	local add = function(intent, score, minHold) {
+		if (intent == null) { return; }
+		GxLdBot.SetTableSlot(intent, "score", score);
+		GxLdBot.SetTableSlot(intent, "minHold", minHold);
+		GxLdBot.SetTableSlot(intent, "lane", intent.kind == "expression" ? "EXPRESSION" : "TEAM");
+		if (!("reason" in intent)) { GxLdBot.SetTableSlot(intent, "reason", intent.kind); }
+		if (idx in GxLdBot.Action) {
+			local active = GxLdBot.Action[idx];
+			if (active.kind == intent.kind && ("minHoldUntil" in active) && now < active.minHoldUntil) {
+				intent.score += 35.0;
+			}
+		}
+		candidates.append(intent);
+	};
+
+	local escort = GxLdBot.EscortIntentFor(bot);
+	if (escort != null) { add({ kind = "escort", pos = escort.pos, human = escort.human }, 100.0, 0.7); }
+
+	if (GxLdBot.Settings.EnableAssist) {
+		local selfDefenseTarget = GxLdBot.SelfDefenseTargetFor(bot);
+		local selfDefense = selfDefenseTarget != null;
+		local plannedTarget = GxLdBot.TeamAssistTargetFor(bot, now);
+		if (idx in GxLdBot.Action && GxLdBot.Action[idx].kind == "assist") {
+			local activeAssist = GxLdBot.Action[idx];
+			if (now < activeAssist.until && "target" in activeAssist &&
+					GxLdBot.IsValidEntity(activeAssist.target) &&
+					(selfDefense || plannedTarget == activeAssist.target)) {
+				add({ kind = "assist", target = activeAssist.target },
+					selfDefense ? 96.0 : 66.0, 0.35);
+			}
+		}
+		local yieldWhenMoving = (!("AssistYieldWhenMoving" in GxLdBot.Settings)) ||
+			GxLdBot.Settings.AssistYieldWhenMoving;
+		local humanMoving = yieldWhenMoving && GxLdBot.HumanIsMoving();
+		if (selfDefense) {
+			add({ kind = "assist", target = selfDefenseTarget, reason = "self_defense" }, 96.0, 0.4);
+		} else if (!humanMoving && plannedTarget != null &&
+				("BotAllowsAssist" in GxLdBot) && GxLdBot.BotAllowsAssist(bot)) {
+			add({ kind = "assist", target = plannedTarget, reason = "team_assist_owner" }, 66.0, 0.35);
+		}
+	}
+
+	local checkBack = GxLdBot.CheckBackIntentFor(bot, idx, now);
+	if (checkBack != null) { add(checkBack, 86.0, 1.1); }
+
+	local progress = null;
+	if ("ProgressIntentFor" in GxLdBot) {
+		progress = GxLdBot.NormalizeProgressIntent(GxLdBot.ProgressIntentFor(bot));
+		if (progress != null) {
+			local slot = ("FormationSlotFor" in GxLdBot) ? GxLdBot.FormationSlotFor(bot) : "none";
+			local score = (slot == "point") ? 78.0 : 69.0;
+			if (progress.kind == "guide") { score += 3.0; }
+			add(progress, score, (progress.kind == "guide") ? 1.0 : 0.65);
+		}
+	}
+	if (progress == null && (!("HasAliveHuman" in GxLdBot) || !GxLdBot.HasAliveHuman())) {
+		local scoutPos = GxLdBot.ScoutIntentFor(bot);
+		if (scoutPos != null) { add({ kind = "scout", pos = scoutPos }, 62.0, 0.6); }
+	}
+
+	if ("ExpressionIntentFor" in GxLdBot) {
+		add(GxLdBot.ExpressionIntentFor(bot), 34.0, 0.8);
+	}
+	local human = GxLdBot.IdleIntentFor(bot);
+	if (human != null) { add({ kind = "idle", human = human }, 18.0, 0.7); }
+
+	local best = null;
+	foreach (i, candidate in candidates) {
+		if (best == null || candidate.score > best.score) { best = candidate; }
+	}
+	return best;
 }
 
 // ---- intent selection -------------------------------------------------------
@@ -971,7 +1300,8 @@ function GxLdBot::ComputeIntent(bot, idx, now) {
 	if (GxLdBot.Settings.EnableRescue) {
 		local r = GxLdBot.RescueVictimFor(bot);
 		if (r != null) {
-			return { kind = "rescue", info = r };
+			return { kind = "rescue", info = r, lane = "SURVIVAL", score = 1000.0,
+				minHold = 0.0, reason = "rescue_claim" };
 		}
 	}
 
@@ -979,7 +1309,8 @@ function GxLdBot::ComputeIntent(bot, idx, now) {
 	// threat near them (Witch / special / close commons) instead of watching.
 	local defend = GxLdBot.EmergencyDefendIntentFor(bot);
 	if (defend != null) {
-		return { kind = "defend", info = defend };
+		return { kind = "defend", info = defend, lane = "SURVIVAL", score = 980.0,
+			minHold = 0.0, reason = "perceived_emergency" };
 	}
 
 	// 3) retreat — continue an active burst, else maybe start a new one
@@ -989,7 +1320,8 @@ function GxLdBot::ComputeIntent(bot, idx, now) {
 				local t = GxLdBot.NearestThreatNear(bot,
 					GxLdBot.Settings.RetreatCommonRadius, GxLdBot.Settings.RetreatCommonRadius * 2.0);
 				if (t != null) {
-					return { kind = "retreat", threat = t };
+					return { kind = "retreat", threat = t, lane = "SURVIVAL", score = 940.0,
+						minHold = 0.15, reason = "retreat_continue" };
 				}
 			}
 			// burst finished (or threat gone): start cooldown and fall through
@@ -1001,7 +1333,8 @@ function GxLdBot::ComputeIntent(bot, idx, now) {
 			local t2 = GxLdBot.NearestThreatNear(bot,
 				GxLdBot.Settings.RetreatCommonRadius, GxLdBot.Settings.RetreatCommonRadius * 2.0);
 			if (t2 != null) {
-				return { kind = "retreat", threat = t2 };
+				return { kind = "retreat", threat = t2, lane = "SURVIVAL", score = 940.0,
+					minHold = 0.15, reason = "close_pressure" };
 			}
 		}
 	}
@@ -1010,96 +1343,29 @@ function GxLdBot::ComputeIntent(bot, idx, now) {
 	if (GxLdBot.Settings.EnableCover) {
 		local v = GxLdBot.CoverVictimFor(bot);
 		if (v != null) {
-			return { kind = "cover", victim = v };
+			return { kind = "cover", victim = v, lane = "SURVIVAL", score = 900.0,
+				minHold = 0.35, reason = "cover_claim" };
 		}
 	}
 
 	// 5) heal self: start only when safe, then commit long enough to finish.
 	if (GxLdBot.Settings.EnableHeal && GxLdBot.HealShouldContinue(bot, idx, now)) {
-		return { kind = "heal" };
+		return { kind = "heal", lane = "SURVIVAL", score = 860.0,
+			minHold = 0.5, reason = "heal_continue" };
 	}
 	if (GxLdBot.Settings.EnableHeal && GxLdBot.HealIntentFor(bot)) {
-		return { kind = "heal" };
+		return { kind = "heal", lane = "SURVIVAL", score = 860.0,
+			minHold = 0.5, reason = "heal_safe" };
 	}
 
 	// 6) frequent close-threat shove (right click) before optional movement.
 	local shoveTarget = GxLdBot.CombatShoveTargetFor(bot, idx, now);
 	if (shoveTarget != null) {
-		return { kind = "shove", target = shoveTarget };
+		return { kind = "shove", target = shoveTarget, lane = "SURVIVAL", score = 820.0,
+			minHold = 0.2, reason = "close_threat" };
 	}
 
-	// 7) catch up to the human before doing optional pressure actions.
-	local escort = GxLdBot.EscortIntentFor(bot);
-	if (escort != null) {
-		return { kind = "escort", pos = escort.pos, human = escort.human };
-	}
-
-	// 8) close-horde assist: short attack bursts to help clear swarmed teammates.
-	// GATE (player request "bots should walk WITH me, not peel off to farm zombies"):
-	// while the human is actively moving and it's not a real emergency, DON'T start a
-	// fresh assist â fall through to progress/guide/escort so the bot travels with the
-	// player. An assist burst already in progress still finishes (cutting it mid-swing
-	// looks worse than letting it end). When the human stops (or a teammate is truly
-	// swarmed/pinned), assist resumes normally.
-	if (GxLdBot.Settings.EnableAssist) {
-		if (idx in GxLdBot.Action && GxLdBot.Action[idx].kind == "assist") {
-			local a = GxLdBot.Action[idx];
-			if (now < a.until && "target" in a && GxLdBot.IsValidEntity(a.target)) {
-				return { kind = "assist", target = a.target };
-			}
-		}
-		// SELF-DEFENSE always wins: a bot swarmed/specialed at close range must be
-		// allowed to fight back even while the human is moving — suppressing that was
-		// why a trailing bot got surrounded and couldn't shoot back. Only a NON-self
-		// assist (peeling off to clear trash around a DISTANT teammate) yields to
-		// travel-with-the-human, and even that only while the human is actually moving
-		// and it isn't a real emergency.
-		local selfDefense = ("AssistIsSelfDefense" in GxLdBot) && GxLdBot.AssistIsSelfDefense(bot);
-		// AssistYieldWhenMoving=false restores always-on assist (never yield travel to
-		// the moving human). When true (default) a moving human suppresses non-self
-		// assist so bots travel WITH the player instead of peeling off to farm trash.
-		local yieldWhenMoving = (!("AssistYieldWhenMoving" in GxLdBot.Settings))
-			|| GxLdBot.Settings.AssistYieldWhenMoving;
-		local humanMoving = yieldWhenMoving
-			&& ("HumanIsMoving" in GxLdBot) && GxLdBot.HumanIsMoving();
-		local emergency = ("TeamEmergency" in GxLdBot) && GxLdBot.TeamEmergency();
-		if (selfDefense || !humanMoving || emergency) {
-			local assistTarget = GxLdBot.AssistTargetFor(bot);
-			if (assistTarget != null) {
-				return { kind = "assist", target = assistTarget };
-			}
-		}
-	}
-
-	// 9) progress / scout (path clear). Flow-based map
-	// advancement (progress.nut) is tried first so bots push toward the actual
-	// objective; the old human-relative scout is a fallback for maps with no
-	// usable flow (finales / survival).
-	if ("ProgressIntentFor" in GxLdBot) {
-		local pres = GxLdBot.ProgressIntentFor(bot);
-		if (pres != null) {
-			// ProgressIntentFor returns either a bare Vector (walk toward it) or a
-			// { guide = true, human = ... } table (scout reached its lead point —
-			// hold ground and face the human, "this way, follow me"). Distinguish so
-			// we never feed the guide table to BotMoveTo as a position.
-			if (typeof pres == "table" && ("guide" in pres)) {
-				return { kind = "guide", human = pres.human };
-			}
-			return { kind = "progress", pos = pres };
-		}
-	}
-	local spos = GxLdBot.ScoutIntentFor(bot);
-	if (spos != null) {
-		return { kind = "scout", pos = spos };
-	}
-
-	// 10) idle (calm stall) — reuses social's decision
-	local human = GxLdBot.IdleIntentFor(bot);
-	if (human != null) {
-		return { kind = "idle", human = human };
-	}
-
-	return null;
+	return GxLdBot.SelectUtilityIntent(bot, idx, now);
 }
 
 // ---- enactment --------------------------------------------------------------
@@ -1128,12 +1394,15 @@ function GxLdBot::IssueMoveIntent(bot, idx, kind, pos, faceEnt, now) {
 	} else {
 		local far = true;
 		try { far = (a.pos == null) || ((a.pos - pos).Length() > 120.0); } catch (e) { far = true; }
-		if (far || (now - a.movedAt) > 1.5) {
+		if (far || (now - a.movedAt) > GxLdBot.Settings.MoveCommandRefresh) {
 			reissue = true;
 		}
 	}
 	if (reissue) {
-		GxLdBot.BotMoveTo(bot, pos);
+		if (!GxLdBot.BotMoveTo(bot, pos)) {
+			GxLdBot.EndAction(bot, idx, true);
+			return null;
+		}
 		a.pos = pos;
 		a.movedAt = now;
 	}
@@ -1165,7 +1434,7 @@ function GxLdBot::EnactIntent(bot, idx, intent, now) {
 		a.until = now + 1.2;
 		GxLdBot.ClearShove(bot);
 		GxLdBot.ClearHeal(bot);
-		GxLdBot.BotAttackTarget(bot, info.target);
+		if (!GxLdBot.BotAttackTarget(bot, info.target)) { GxLdBot.EndAction(bot, idx, true); }
 		return;
 	}
 
@@ -1191,6 +1460,7 @@ function GxLdBot::EnactIntent(bot, idx, intent, now) {
 			if ((b & GxLdBot.BTN_USE) == 0) {
 				NetProps.SetPropInt(bot, "m_afButtonForced", b | GxLdBot.BTN_USE);
 			}
+			GxLdBot.LeaseForcedBit(bot, GxLdBot.BTN_USE);
 		} catch (e) {}
 		GxLdBot.ClearShove(bot);
 		return;
@@ -1221,7 +1491,7 @@ function GxLdBot::EnactIntent(bot, idx, intent, now) {
 		}
 		a.target = intent.target;
 		GxLdBot.ClearHeal(bot);
-		GxLdBot.SetShove(bot, intent.target);
+		if (!GxLdBot.SetShove(bot, intent.target)) { GxLdBot.EndAction(bot, idx, true); }
 		return;
 	}
 
@@ -1261,10 +1531,10 @@ function GxLdBot::EnactIntent(bot, idx, intent, now) {
 		} catch (e) {}
 
 		if (GxLdBot.Settings.EnableShove && info.shovable && inShoveRange) {
-			GxLdBot.SetShove(bot, info.special);
+			if (!GxLdBot.SetShove(bot, info.special)) { GxLdBot.EndAction(bot, idx, true); }
 		} else {
 			GxLdBot.ClearShove(bot);
-			GxLdBot.BotAttackTarget(bot, info.special);
+			if (!GxLdBot.BotAttackTarget(bot, info.special)) { GxLdBot.EndAction(bot, idx, true); }
 		}
 		return;
 	}
@@ -1293,7 +1563,7 @@ function GxLdBot::EnactIntent(bot, idx, intent, now) {
 		}
 		a.target = intent.threat;
 		GxLdBot.ClearShove(bot);
-		GxLdBot.BotRetreatFrom(bot, intent.threat);
+		if (!GxLdBot.BotRetreatFrom(bot, intent.threat)) { GxLdBot.EndAction(bot, idx, true); }
 		return;
 	}
 
@@ -1376,7 +1646,7 @@ function GxLdBot::EnactIntent(bot, idx, intent, now) {
 		}
 		a.target = intent.target;
 		GxLdBot.ClearShove(bot);
-		GxLdBot.BotAttackTarget(bot, intent.target);
+		if (!GxLdBot.BotAttackTarget(bot, intent.target)) { GxLdBot.EndAction(bot, idx, true); }
 		return;
 	}
 
@@ -1403,8 +1673,21 @@ function GxLdBot::EnactIntent(bot, idx, intent, now) {
 			try { holdPos = bot.GetOrigin(); } catch (e) {}
 			a = { kind = "guide", since = now, until = 0.0, ready = 0.0,
 				target = intent.human, pos = holdPos, basePos = holdPos, fidgetAt = now,
-				movedAt = now, holding = true, claimKey = null };
+				nextGazeAt = now, movedAt = now, holding = true, claimKey = null };
 			GxLdBot.SetTableSlot(GxLdBot.Action, idx, a);
+			// PIN NOW (the fix the comment above always described but never did): the
+			// prior action was ended with reset, so without an immediate move-to-self
+			// vanilla owns the bot until the drift check below first fires (>80u), and
+			// in those seconds it walks the ahead-of-team bot back toward the human —
+			// the exact lead-shrink / back-and-forth this block exists to prevent. One
+			// move-to-hold on creation claims the spot right away. If that command
+			// FAILS (CanControlBots false / CommandABot missing), don't leave a dead
+			// guide action that never retries (creation drift is 0) — end it and let
+			// vanilla have the bot this tick.
+			if (holdPos == null || !GxLdBot.BotMoveTo(bot, holdPos)) {
+				GxLdBot.EndAction(bot, idx, true);
+				return;
+			}
 			GxLdBot.Notify("action:guide:" + idx,
 				GxLdBot.SafeName(bot) + " leading the way", 12.0);
 		}
@@ -1426,24 +1709,92 @@ function GxLdBot::EnactIntent(bot, idx, intent, now) {
 			local r = GxLdBot.Settings.FidgetRadius;
 			local ang = GxLdBot.RandFloat(0.0, 6.283);
 			local dist = GxLdBot.RandFloat(r * 0.35, r);
-			a.pos = Vector(a.basePos.x + cos(ang) * dist, a.basePos.y + sin(ang) * dist,
+			local cand = Vector(a.basePos.x + cos(ang) * dist, a.basePos.y + sin(ang) * dist,
 				a.basePos.z);
+			// NAV VALIDATION (垂直图防摔): the raw random point can land in a wall,
+			// off-mesh, or over a one-way drop near railings/ledges. Only adopt it if
+			// a nav area sits under it on the same floor; otherwise keep the current
+			// hold spot (skip this fidget) so we never command the point off a cliff.
+			if (!("FidgetPointSafe" in GxLdBot) || GxLdBot.FidgetPointSafe(cand, a.basePos.z)) {
+				a.pos = cand;
+			}
 		}
 		if (a.pos != null) {
 			local drift = 0.0;
 			try { drift = (bot.GetOrigin() - a.pos).Length(); } catch (e2) {}
-			if (drift > 80.0 || (now - a.movedAt) > 2.0) {
-				GxLdBot.BotMoveTo(bot, a.pos);
+			if (drift > 80.0 || (drift > 30.0 && (now - a.movedAt) > 4.0)) {
+				if (!GxLdBot.BotMoveTo(bot, a.pos)) {
+					GxLdBot.EndAction(bot, idx, true);
+					return;
+				}
 				a.movedAt = now;
 			}
 		}
-		if (GxLdBot.IsValidEntity(intent.human)) {
-			// While holding as a guide, occasionally teabag at the human ("this way!")
-			// — this is the main place the player will actually SEE goofing, since a
-			// scout out front hits guide-hold far more often than the whole team goes
-			// idle. GoofTick owns crouch+facing during an antic; otherwise just face.
-			if (!GxLdBot.GoofTick(bot, idx, intent.human, now, GxLdBot.Settings.SquadDispersionMax)) {
-				GxLdBot.FaceEntity(bot, intent.human); // turn back toward the human: "this way"
+		if (!("nextGazeAt" in a)) {
+			GxLdBot.SetTableSlot(a, "nextGazeAt", now);
+		}
+		local gazeSafe = !("GuideGazeOnlySafe" in GxLdBot.Settings) ||
+			!GxLdBot.Settings.GuideGazeOnlySafe ||
+			(("TeamModel" in GxLdBot) && GxLdBot.TeamModel.phase == "SAFE");
+		if (gazeSafe && GxLdBot.IsValidEntity(intent.human) && now >= a.nextGazeAt) {
+			// A visible look-back pulse, not continuous 0.18s aim authoring. Expression
+			// antics are intentionally removed from guide until the later scheduler can
+			// budget and stagger them safely.
+			GxLdBot.FaceEntity(bot, intent.human);
+			a.nextGazeAt = now + GxLdBot.RandFloat(
+				GxLdBot.Settings.GuideGazePulseMin, GxLdBot.Settings.GuideGazePulseMax);
+		}
+		// NOTE: the old CHECK_BACK state machine used to make a parked point PHYSICALLY
+		// walk back to the human after GuideCheckBackDelay, then sit on a 10s cooldown
+		// before it could lead again. In play that read as "weird": you stop to fight /
+		// loot, the breadcrumb suddenly turns around and comes back, and when you move
+		// on there's nobody out front for 10s. A leading buddy who is genuinely ahead
+		// should HOLD the forward spot and keep glancing back (the pulse-gaze above) —
+		// not abandon the lead. When you catch up / pass the bot, humanFlow >= botFlow
+		// and progress re-pushes it forward on its own. So: no physical walk-back.
+		return;
+	}
+
+	// Relay hold: keep the bridge bot at its midpoint without copying the point's
+	// look-back performance. It only holds formation; attention remains vanilla.
+	if (intent.kind == "relay_hold") {
+		local a = (idx in GxLdBot.Action) ? GxLdBot.Action[idx] : null;
+		if (a != null && a.kind != "relay_hold") {
+			GxLdBot.EndAction(bot, idx, true);
+			a = null;
+		}
+		if (a == null) {
+			local holdPos = null;
+			try { holdPos = bot.GetOrigin(); } catch (e) {}
+			a = { kind = "relay_hold", since = now, until = 0.0, ready = 0.0,
+				target = intent.human, pos = holdPos, movedAt = now,
+				holding = true, claimKey = null };
+			GxLdBot.SetTableSlot(GxLdBot.Action, idx, a);
+			// PIN the relay at its arrival spot on creation (same as guide): the
+			// EndAction(...,true) above handed control to vanilla, which would walk the
+			// bot back toward the human before the drift re-command below ever fires.
+			// A move-to-self holds the formation slot from tick one. If holdPos is
+			// null (GetOrigin threw) OR the command fails (no lease / CanControlBots
+			// false), don't leave a dead relay_hold action with pos=null that will
+			// NEVER retry (a.pos != null never holds, so the drift re-command below is
+			// unreachable) and never self-heal — end it and let the arbiter re-plan
+			// next tick. Written identically to the guide block so the two can't drift.
+			if (holdPos == null || !GxLdBot.BotMoveTo(bot, holdPos)) {
+				GxLdBot.EndAction(bot, idx, true);
+				return;
+			}
+		}
+		GxLdBot.ClearShove(bot);
+		GxLdBot.ClearGoof(bot);
+		if (a.pos != null) {
+			local drift = 0.0;
+			try { drift = (bot.GetOrigin() - a.pos).Length(); } catch (e2) {}
+			if (drift > 80.0 || (drift > 30.0 && (now - a.movedAt) > 4.0)) {
+				if (!GxLdBot.BotMoveTo(bot, a.pos)) {
+					GxLdBot.EndAction(bot, idx, true);
+					return;
+				}
+				a.movedAt = now;
 			}
 		}
 		return;
@@ -1451,6 +1802,16 @@ function GxLdBot::EnactIntent(bot, idx, intent, now) {
 
 	if (intent.kind == "progress") {
 		GxLdBot.IssueMoveIntent(bot, idx, "progress", intent.pos, null, now);
+		return;
+	}
+
+	if (intent.kind == "relay") {
+		GxLdBot.IssueMoveIntent(bot, idx, "relay", intent.pos, null, now);
+		return;
+	}
+
+	if (intent.kind == "checkback") {
+		GxLdBot.IssueMoveIntent(bot, idx, "checkback", intent.pos, intent.human, now);
 		return;
 	}
 
@@ -1464,20 +1825,58 @@ function GxLdBot::EnactIntent(bot, idx, intent, now) {
 		return;
 	}
 
+	if (intent.kind == "expression") {
+		local a = (idx in GxLdBot.Action) ? GxLdBot.Action[idx] : null;
+		if (a != null && a.kind != "expression") {
+			GxLdBot.EndAction(bot, idx, true);
+			a = null;
+		}
+		if (a == null) {
+			a = { kind = "expression", since = now, until = intent.until, ready = 0.0,
+				target = intent.human, pos = intent.pos, movedAt = 0.0, holding = true,
+				claimKey = null, expressionKind = intent.expressionKind,
+				lastToggle = 0.0, ducked = false, gazeDone = false };
+			GxLdBot.SetTableSlot(GxLdBot.Action, idx, a);
+			// Expression owns no movement. Ending the previous action/resetting first is
+			// what makes a crouch/check-in visibly stationary.
+		}
+		a.until = intent.until;
+		a.target = intent.human;
+		a.pos = intent.pos;
+		GxLdBot.ClearShove(bot);
+		GxLdBot.ClearHeal(bot);
+		if (a.expressionKind == "attention") {
+			if (!a.gazeDone && a.pos != null) {
+				if (!GxLdBot.FacePosition(bot, a.pos)) { GxLdBot.EndAction(bot, idx, true); return; }
+				a.gazeDone = true;
+			}
+		} else if (a.expressionKind == "checkin") {
+			if (!a.gazeDone && GxLdBot.IsValidEntity(a.target)) {
+				if (!GxLdBot.FaceEntity(bot, a.target)) { GxLdBot.EndAction(bot, idx, true); return; }
+				a.gazeDone = true;
+			}
+		} else if (a.expressionKind == "goof") {
+			if (!a.gazeDone && GxLdBot.IsValidEntity(a.target)) {
+				GxLdBot.FaceEntity(bot, a.target);
+				a.gazeDone = true;
+			}
+			if ((now - a.lastToggle) >= GxLdBot.Settings.GoofCrouchToggle) {
+				a.lastToggle = now;
+				try {
+					local bits = NetProps.GetPropInt(bot, "m_afButtonForced");
+					a.ducked = ((bits & GxLdBot.BTN_DUCK) == 0);
+					NetProps.SetPropInt(bot, "m_afButtonForced",
+						a.ducked ? (bits | GxLdBot.BTN_DUCK) : (bits & ~GxLdBot.BTN_DUCK));
+					if (a.ducked) { GxLdBot.LeaseForcedBit(bot, GxLdBot.BTN_DUCK); }
+					else { GxLdBot.ReleaseForcedBit(bot, GxLdBot.BTN_DUCK); }
+				} catch (e) {}
+			}
+		}
+		return;
+	}
+
 	if (intent.kind == "idle") {
 		local human = intent.human;
-		// Teabag FIRST: if an antic is running, the bot must STAND STILL so the
-		// crouch is actually visible. The old code always issued a wander move, so
-		// a bot "teabagged" while circling the human and you could never see it.
-		// Only wander when NOT mid-antic.
-		if (GxLdBot.GoofTick(bot, idx, human, now)) {
-			// Standing ground + crouching + facing the human (GoofTick faces).
-			if (idx in GxLdBot.Action && GxLdBot.Action[idx].kind != "idle") {
-				GxLdBot.EndAction(bot, idx, true);
-			}
-			GxLdBot.IdleSpeak(bot, human);
-			return;
-		}
 		local pos = null;
 		pos = GxLdBot.IdleWanderPos(bot, human);
 		if (pos == null) {
@@ -1488,7 +1887,6 @@ function GxLdBot::EnactIntent(bot, idx, intent, now) {
 			return;
 		}
 		GxLdBot.IssueMoveIntent(bot, idx, "idle", pos, human, now);
-		GxLdBot.FaceEntity(bot, human);
 		GxLdBot.IdleSpeak(bot, human); // logs only; idle does not force voice lines
 		return;
 	}
@@ -1499,6 +1897,9 @@ function GxLdBot::EnactIntent(bot, idx, intent, now) {
 function GxLdBot::EndAction(bot, idx, doReset) {
 	if (idx in GxLdBot.Action) {
 		local a = GxLdBot.Action[idx];
+		if (a.kind == "expression" && "ExpressionPlan" in GxLdBot && idx in GxLdBot.ExpressionPlan) {
+			delete GxLdBot.ExpressionPlan[idx];
+		}
 		if ("claimKey" in a && a.claimKey != null) {
 			try {
 				if (a.claimKey in GxLdBot.Claims && GxLdBot.Claims[a.claimKey].owner == idx) {
@@ -1536,6 +1937,54 @@ function GxLdBot::ClearAllActions(doReset) {
 	});
 }
 
+// Unified actuator cleanup. This is intentionally safe to call while Sleeping:
+// new enactment is blocked, but reset/bit release must still be allowed so the
+// script can hand every bot back to vanilla during multiplayer sleep, takeover,
+// round transitions, or module shutdown.
+function GxLdBot::QuiesceBot(bot, reason = "quiesce", doReset = true) {
+	if (!GxLdBot.IsValidEntity(bot)) {
+		return;
+	}
+	local idx = bot.GetEntityIndex();
+	GxLdBot.ReleaseMovementBoost(bot, reason);
+	if (idx in GxLdBot.Action) {
+		GxLdBot.EndAction(bot, idx, doReset);
+	} else {
+		GxLdBot.ClearShove(bot);
+		GxLdBot.ClearHeal(bot);
+		GxLdBot.ClearGoof(bot);
+		local ownsCommand = false;
+		if (idx in GxLdBot.ActuatorLease) {
+			ownsCommand = GxLdBot.ActuatorLease[idx].commandOwned;
+		}
+		if (doReset && ownsCommand) {
+			GxLdBot.BotResetCommand(bot);
+		}
+	}
+	if (idx in GxLdBot.ActuatorLease) {
+		delete GxLdBot.ActuatorLease[idx];
+	}
+	GxLdBot.Log("quiesce " + GxLdBot.SafeName(bot) + " reason=" + reason);
+}
+
+function GxLdBot::QuiesceAll(reason = "quiesce_all") {
+	GxLdBot.ForEachSurvivorBot(function(bot) {
+		GxLdBot.QuiesceBot(bot, reason, true);
+	});
+	// Covers takeover/team-swap entities that are no longer returned as bots but
+	// still carry a lease indexed from the previous frame.
+	GxLdBot.ReleaseAllMovementBoosts(reason);
+	GxLdBot.Action = {};
+	GxLdBot.ActuatorLease = {};
+	GxLdBot.Claims = {};
+	GxLdBot.CheckBack = {};
+	GxLdBot.GuideCooldownUntil = {};
+	GxLdBot.ExpressionPlan = {};
+	GxLdBot.ExpressionPlanTime = -999.0;
+	GxLdBot.SpeechQueue = [];
+	GxLdBot.TeamAssistPlan = { owner = -1, target = null, until = 0.0, frameSerial = -1 };
+}
+
 // ---- the arbiter tick -------------------------------------------------------
 
 function GxLdBot::ActionArbiterTick() {
@@ -1544,7 +1993,7 @@ function GxLdBot::ActionArbiterTick() {
 	}
 	if (!GxLdBot.Settings.EnableActions) {
 		if (!GxLdBot.ActionDisabledCleaned) {
-			GxLdBot.ClearAllActions(true);
+			GxLdBot.QuiesceAll("actions_disabled");
 			GxLdBot.ActionDisabledCleaned = true;
 			GxLdBot.Log("actions disabled: reset all bot commands", true);
 		}
@@ -1552,9 +2001,35 @@ function GxLdBot::ActionArbiterTick() {
 	}
 	GxLdBot.ActionDisabledCleaned = false;
 	local now = GxLdBot.Now();
+	// Per-tick heavy-work budget is now a COUNTER, not a single boolean. The old
+	// single-slot flag let only ONE bot run a nav expansion per tick, so point and
+	// relay had to alternate — one advanced while the other held, producing the
+	// "走一步停一步" step-stop the player reported. A small count (HeavySliceMax)
+	// lets BOTH leaders expand nav on the same tick while still capping total heavy
+	// ops per tick so we never return to the unbounded PERF spikes. The infected
+	// sampler, when it does a scan, consumes one slot.
+	GxLdBot.HeavySliceCount = (("UpdateThreatSampler" in GxLdBot)
+		&& GxLdBot.UpdateThreatSampler()) ? 1 : 0;
 
 	GxLdBot.AssignRescues(now);
 	GxLdBot.AssignCover(now);
+	GxLdBot.AssignTeamAssist(now);
+
+	// Compute the point's read-only decision first. This gives the lead bot first
+	// refusal on the single heavy nav-expansion slice even when entity iteration
+	// happens to visit the relay first. If point reuses cache/holds, the slice stays
+	// free and the relay may consume it later in the same arbiter tick.
+	local precomputedPointIdx = -1;
+	local precomputedPointIntent = null;
+	local heavyMax = ("HeavySliceMax" in GxLdBot.Settings) ? GxLdBot.Settings.HeavySliceMax : 3;
+	if (GxLdBot.HeavySliceCount < heavyMax && ("FormationEntityFor" in GxLdBot)) {
+		local pointBot = GxLdBot.FormationEntityFor("point");
+		if (pointBot != null && GxLdBot.IsValidEntity(pointBot) && GxLdBot.IsAlive(pointBot) &&
+				!GxLdBot.IsUncommandable(pointBot)) {
+			precomputedPointIdx = pointBot.GetEntityIndex();
+			precomputedPointIntent = GxLdBot.ComputeIntent(pointBot, precomputedPointIdx, now);
+		}
+	}
 
 	GxLdBot.ForEachSurvivorBot(function(bot) {
 		local idx = bot.GetEntityIndex();
@@ -1583,7 +2058,8 @@ function GxLdBot::ActionArbiterTick() {
 			return;
 		}
 
-		local intent = GxLdBot.ComputeIntent(bot, idx, now);
+		local intent = (idx == precomputedPointIdx)
+			? precomputedPointIntent : GxLdBot.ComputeIntent(bot, idx, now);
 		if (intent == null) {
 			if (idx in GxLdBot.Action) {
 				GxLdBot.EndAction(bot, idx, true); // transition to vanilla — reset ONCE
@@ -1594,6 +2070,19 @@ function GxLdBot::ActionArbiterTick() {
 		}
 
 		GxLdBot.EnactIntent(bot, idx, intent, now);
+		if (idx in GxLdBot.Action && ("minHold" in intent)) {
+			local holdUntil = now + intent.minHold;
+			if (!("minHoldUntil" in GxLdBot.Action[idx]) ||
+					GxLdBot.Action[idx].minHoldUntil < holdUntil) {
+				GxLdBot.SetTableSlot(GxLdBot.Action[idx], "minHoldUntil", holdUntil);
+			}
+			GxLdBot.SetTableSlot(GxLdBot.Action[idx], "lane",
+				("lane" in intent) ? intent.lane : "TEAM");
+			GxLdBot.SetTableSlot(GxLdBot.Action[idx], "score",
+				("score" in intent) ? intent.score : 0.0);
+			GxLdBot.SetTableSlot(GxLdBot.Action[idx], "reason",
+				("reason" in intent) ? intent.reason : intent.kind);
+		}
 	});
 }
 
@@ -1601,10 +2090,16 @@ function GxLdBot::PrintActions(player) {
 	local any = false;
 	foreach (idx, a in GxLdBot.Action) {
 		any = true;
-		local tgt = ("target" in a && a.target != null && GxLdBot.IsValidEntity(a.target))
-			? GxLdBot.SafeName(a.target) : "-";
+		local tgt = "-";
+		if ("target" in a && a.target != null && GxLdBot.IsValidEntity(a.target)) {
+			tgt = GxLdBot.SafeName(a.target);
+			if (tgt == "") { try { tgt = a.target.GetClassname(); } catch (e) { tgt = "entity"; } }
+		}
 		GxLdBot.Chat(player, "idx=" + idx + " action=" + a.kind +
-			" target=" + tgt + " for=" + (GxLdBot.Now() - a.since) + "s");
+			" lane=" + (("lane" in a) ? a.lane : "-") +
+			" score=" + (("score" in a) ? a.score : 0) +
+			" target=" + tgt + " for=" + (GxLdBot.Now() - a.since) + "s" +
+			" reason=" + (("reason" in a) ? a.reason : "-"));
 	}
 	if (!any) {
 		GxLdBot.Chat(player, "no active bot actions (all on vanilla AI)");
@@ -1616,6 +2111,12 @@ function GxLdBot::PrintActions(player) {
 function GxLdBot::ArbiterThink() {
 	GxLdBot.SafeCall("arbiter", function() {
 		GxLdBot.ActionArbiterTick();
+	});
+	// Persistent game log sampling: runs on its own interval (GameLogInterval),
+	// independent of the arbiter tick, so we get a steady per-bot telemetry stream
+	// to review after a play session. Guarded/throttled inside GameLogSample.
+	GxLdBot.SafeCall("gamelog", function() {
+		if ("GameLogSample" in GxLdBot) { GxLdBot.GameLogSample(); }
 	});
 	return GxLdBot.Settings.ArbiterInterval;
 }
@@ -1650,6 +2151,12 @@ function GxLdBot::StartArbiterThink() {
 
 GxLdBot.RegisterRound("actions_reset", function() {
 	GxLdBot.Action = {};
+	GxLdBot.ActuatorLease = {};
+	GxLdBot.CheckBack = {};
+	GxLdBot.GuideCooldownUntil = {};
+	GxLdBot.ExpressionPlan = {};
+	GxLdBot.ExpressionPlanTime = -999.0;
+	GxLdBot.TeamAssistPlan = { owner = -1, target = null, until = 0.0, frameSerial = -1 };
 	GxLdBot.RetreatCooldownUntil = {};
 	GxLdBot.ShoveCooldownUntil = {};
 	GxLdBot.ActionDisabledCleaned = false;

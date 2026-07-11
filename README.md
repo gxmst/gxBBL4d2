@@ -10,7 +10,7 @@ Buddy Bots for L4D2.
 
 ## Status
 
-Current version: `1.0`
+Current version: `1.1-dev3`
 
 This is the first stable release. It is built for single-player and local bot
 testing first. It does not replace the Source engine survivor AI. It nudges
@@ -35,22 +35,27 @@ Rule of thumb: randomize timing and style, not basic survival responsibility.
 - Player-like default behavior mode with wider-but-bounded forward pressure.
 - Old escort-style mode for the previous tighter, human-centered behavior.
 - Conservative safe mode for debugging.
-- Per-bot roles forming a two-group formation: point + flanker scout ahead,
-  anchor/follower stay back as the rear guard.
+- Stable point / relay / rear / flex formation: one bot chooses the route, the
+  relay bridges 70% of the gap, and the rear/flex remain human-connected.
 - Flow-based map advancement using nav-mesh flow gradient ascent when available.
   A lead scout that reaches its point holds ground and turns to face you ("this
   way") instead of shuffling back and forth.
-- Rubber-band movement: a bot that falls far behind the squad speeds up to
-  rejoin instead of trailing and getting surrounded.
-- Per-bot personality profiles and roguelike bot cards with rarity tiers
-  (common / rare / legendary), including movespeed cards. No two teammates draw
-  the same card.
+- Reverse-path Safety Gate: leads beyond the conservative 700-unit envelope
+  must prove a nav path back to the human; unknown or one-way candidates fail closed.
+- Five-phase team awareness (`SAFE`, `ALERT`, `COMBAT`, `EMERGENCY`,
+  `AFTERMATH`) with delayed per-bot perception, stress, and momentum.
+- Stable identity traits plus chapter-scoped build cards. Cards tune behavior
+  curves and never overwrite engine movement-speed NetProps.
+- Budgeted idle expression: one initiator and at most one delayed joiner may
+  glance at a point of interest, check in, or briefly crouch.
+- Conservative cross-session memory of human pace/exploration/pressure, used
+  only for slot preference rather than widening the safety envelope.
 - Single action arbiter for move, attack, shove, retreat, cover, assist,
   progress, scout, guide, idle, and optional scripted rescue actions.
 - Assist is suppressed while you are moving (bots travel with you instead of
   farming trash), but a bot always fights back when swarmed itself.
-- Emergency defense for pinned or incapacitated humans, with a small
-  personality-scaled reaction delay so bots do not all snap in unison.
+- Emergency defense and callouts use each bot's delayed perception snapshot so
+  the whole squad does not change stance on the same tick.
 - Ladder-aware: bots hand full control back to the engine while climbing, so
   they no longer fall off mid-climb.
 - Guns-only combat tuning (no melee weapons) with crisper aim tracking.
@@ -97,6 +102,13 @@ Chat commands work in a local/scripted game:
 !hbot_roles
 !hbot_actions
 !hbot_progress_status
+!hbot_minds
+!hbot_navprobe
+!hbot_conceptprobe
+!hbot_wait
+!hbot_moveon
+!hbot_look
+!hbot_style
 !hbot_cards
 !hbot_debug
 !hbot_debugfile
@@ -127,7 +139,7 @@ scripted_user_func hbot_cards
 ```
 
 `hbot_dump` is the handiest one: it prints status, per-bot roles, current
-actions, and flow/lead progress in a single report.
+actions, flow/lead progress, and each bot's perceived phase/stress/momentum.
 
 Typing `!hbot_status` directly at the `]` console prompt is expected to fail;
 that prompt only runs Source console commands.

@@ -60,15 +60,51 @@ function GxLdBot::AssignRoles() {
 	}
 	GxLdBot.ApplyRoleMode();
 
-	local order = ["point", "flanker", "anchor", "follower"];
 	local indices = [];
 	foreach (idx, p in GxLdBot.Profiles) {
 		indices.append(idx);
 	}
 	indices.sort();
+	local assigned = {};
+	local used = {};
+	local pickBest = function(kind) {
+		local bestIdx = -1;
+		local bestScore = -999999.0;
+		foreach (i, idx in indices) {
+			if (idx in used || !(idx in GxLdBot.Profiles)) { continue; }
+			local p = GxLdBot.Profiles[idx];
+			local affinity = ("leadAffinity" in p) ? p.leadAffinity : p.personalLeadBias;
+			local score = 0.0;
+			if (kind == "point") {
+				local explore = ("StyleMemory" in GxLdBot) ? GxLdBot.StyleMemory.exploration : 0.5;
+				local pace = ("StyleMemory" in GxLdBot) ? GxLdBot.StyleMemory.pace : 0.0;
+				if (pace > 180.0) { pace = 180.0; }
+				score = affinity + p.personalLeadBias * 0.35 +
+					p.itemCuriosity * explore * 0.18 + affinity * (pace / 180.0) * 0.08;
+			} else if (kind == "anchor") {
+				local pressure = ("StyleMemory" in GxLdBot) ? GxLdBot.StyleMemory.pressure : 0.0;
+				score = p.rescueBias + (100.0 - affinity) * 0.45 + p.composureBase * 0.2 +
+					p.rescueBias * pressure * 0.12;
+			} else {
+				score = p.composureBase * 0.45 + p.rescueBias * 0.25 + affinity * 0.2;
+			}
+			if (score > bestScore) { bestScore = score; bestIdx = idx; }
+		}
+		if (bestIdx >= 0) { used[bestIdx] <- true; }
+		return bestIdx;
+	};
+	local pointIdx = pickBest("point");
+	local anchorIdx = pickBest("anchor");
+	local flankerIdx = pickBest("flanker");
+	if (pointIdx >= 0) { assigned[pointIdx] <- "point"; }
+	if (anchorIdx >= 0) { assigned[anchorIdx] <- "anchor"; }
+	if (flankerIdx >= 0) { assigned[flankerIdx] <- "flanker"; }
+	foreach (i, idx in indices) {
+		if (!(idx in assigned)) { assigned[idx] <- "follower"; }
+	}
 
 	foreach (slot, idx in indices) {
-		local role = order[slot % order.len()];
+		local role = assigned[idx];
 		local rp = GxLdBot.RoleProfiles[role];
 		local p = GxLdBot.Profiles[idx];
 		local followOffset = ("personalFollowOffset" in p) ? p.personalFollowOffset : 0;
@@ -92,9 +128,12 @@ function GxLdBot::AssignRoles() {
 		GxLdBot.Log("role " + p.name + " role=" + role +
 			" follow=" + p.followDistance + " lead=" + p.leadBias +
 			" personalLead=" + personalLead +
+			" identity=" + (("identityId" in p) ? p.identityId : "none") +
 			" card=" + (("cardName" in p) ? p.cardName : "None"), true);
 	}
 
+	GxLdBot.FormationPlan = {};
+	GxLdBot.FormationTime = -999.0;
 	GxLdBot.ApplyTeamSpacing();
 }
 
@@ -128,15 +167,257 @@ function GxLdBot::ApplyTeamSpacing() {
 
 function GxLdBot::PrintRoles(player) {
 	local any = false;
+	local plan = GxLdBot.UpdateFormationPlan(true);
 	foreach (idx, p in GxLdBot.Profiles) {
 		any = true;
+		local slot = "none";
+		if (("pointIdx" in plan) && plan.pointIdx == idx) { slot = "point"; }
+		else if (("relayIdx" in plan) && plan.relayIdx == idx) { slot = "relay"; }
+		else if (("rearIdx" in plan) && plan.rearIdx == idx) { slot = "rear"; }
+		else if (("flexIdx" in plan) && plan.flexIdx == idx) { slot = "flex"; }
 		GxLdBot.Chat(player, p.name + " role=" + p.role +
-			" follow=" + p.followDistance + " lead=" + p.leadBias +
+			" slot=" + slot + " follow=" + p.followDistance + " lead=" + p.leadBias +
 			" card=" + (("cardName" in p) ? p.cardName : "None"));
 	}
 	if (!any) {
 		GxLdBot.Chat(player, "no roles assigned yet");
 	}
+}
+
+// ---- Buddy formation plan --------------------------------------------------
+//
+// Roles used to be independent personality labels, so point and flanker could
+// both receive autonomous progress pressure on the same tick. The formation
+// plan turns them into team slots: exactly one point leads, one relay bridges
+// toward the human, one rear stays close, and an optional flex remains vanilla.
+
+function GxLdBot::UpdateFormationPlan(force = false) {
+	local now = GxLdBot.Now();
+	local interval = ("FormationInterval" in GxLdBot.Settings)
+		? GxLdBot.Settings.FormationInterval : 0.45;
+	if (!force && (now - GxLdBot.FormationTime) < interval &&
+			("pointIdx" in GxLdBot.FormationPlan)) {
+		return GxLdBot.FormationPlan;
+	}
+
+	local indices = [];
+	GxLdBot.ForEachSurvivorBot(function(bot) {
+		if (GxLdBot.IsAlive(bot)) {
+			indices.append(bot.GetEntityIndex());
+		}
+	});
+	indices.sort();
+
+	local used = {};
+	local pickRole = function(role) {
+		foreach (i, idx in indices) {
+			if (idx in used || !(idx in GxLdBot.Profiles)) {
+				continue;
+			}
+			if (GxLdBot.Profiles[idx].role == role) {
+				used[idx] <- true;
+				return idx;
+			}
+		}
+		return -1;
+	};
+	local pickAny = function() {
+		foreach (i, idx in indices) {
+			if (!(idx in used)) {
+				used[idx] <- true;
+				return idx;
+			}
+		}
+		return -1;
+	};
+
+	local pointIdx = pickRole("point");
+	if (pointIdx < 0) { pointIdx = pickAny(); }
+	local relayIdx = pickRole("flanker");
+	if (relayIdx < 0) { relayIdx = pickAny(); }
+	local rearIdx = pickRole("anchor");
+	if (rearIdx < 0) { rearIdx = pickAny(); }
+	local flexIdx = pickRole("follower");
+	if (flexIdx < 0) { flexIdx = pickAny(); }
+
+	GxLdBot.FormationPlan = {
+		pointIdx = pointIdx,
+		relayIdx = relayIdx,
+		rearIdx = rearIdx,
+		flexIdx = flexIdx,
+		createdAt = now,
+		expiresAt = now + interval
+	};
+	GxLdBot.FormationTime = now;
+	return GxLdBot.FormationPlan;
+}
+
+function GxLdBot::FormationSlotFor(bot) {
+	if (!GxLdBot.IsValidEntity(bot)) {
+		return "none";
+	}
+	local plan = GxLdBot.UpdateFormationPlan(false);
+	local idx = bot.GetEntityIndex();
+	if (("pointIdx" in plan) && plan.pointIdx == idx) { return "point"; }
+	if (("relayIdx" in plan) && plan.relayIdx == idx) { return "relay"; }
+	if (("rearIdx" in plan) && plan.rearIdx == idx) { return "rear"; }
+	if (("flexIdx" in plan) && plan.flexIdx == idx) { return "flex"; }
+	return "none";
+}
+
+function GxLdBot::FormationEntityFor(slot) {
+	local plan = GxLdBot.UpdateFormationPlan(false);
+	local key = slot + "Idx";
+	if (!(key in plan) || plan[key] < 0) {
+		return null;
+	}
+	local found = null;
+	GxLdBot.ForEachSurvivorBot(function(bot) {
+		if (found == null && bot.GetEntityIndex() == plan[key] && GxLdBot.IsAlive(bot)) {
+			found = bot;
+		}
+	});
+	return found;
+}
+
+function GxLdBot::SupportFlowFor(ent) {
+	if (!GxLdBot.IsValidEntity(ent) || !("GetFlowFor" in GxLdBot)) {
+		return null;
+	}
+	local now = GxLdBot.Now();
+	if ((now - GxLdBot.SupportFlowCacheTime) >= GxLdBot.Settings.SupportCacheSeconds) {
+		GxLdBot.SupportFlowCacheTime = now;
+		GxLdBot.SupportFlowCache = {};
+	}
+	local idx = ent.GetEntityIndex();
+	if (idx in GxLdBot.SupportFlowCache) {
+		return GxLdBot.SupportFlowCache[idx];
+	}
+	try {
+		local flow = GxLdBot.GetFlowFor(ent.GetOrigin());
+		GxLdBot.SetTableSlot(GxLdBot.SupportFlowCache, idx, flow);
+		return flow;
+	} catch (e) {}
+	return null;
+}
+
+function GxLdBot::SupportLinkPositions(posA, flowA, posB, flowB) {
+	if (posA == null || posB == null) {
+		return false;
+	}
+	local dz = posA.z - posB.z;
+	if (dz < 0) { dz = -dz; }
+	if (dz > GxLdBot.Settings.SupportLinkMaxZ) {
+		return false;
+	}
+	try {
+		if ((posA - posB).Length() > GxLdBot.Settings.SupportLinkDistance) {
+			return false;
+		}
+	} catch (e) {
+		return false;
+	}
+	if (flowA != null && flowB != null) {
+		local df = flowA - flowB;
+		if (df < 0) { df = -df; }
+		if (df > GxLdBot.Settings.SupportLinkFlow) {
+			return false;
+		}
+	}
+	return true;
+}
+
+function GxLdBot::SupportLinkEntities(a, b) {
+	if (!GxLdBot.IsValidEntity(a) || !GxLdBot.IsValidEntity(b) ||
+			!GxLdBot.IsAlive(a) || !GxLdBot.IsAlive(b)) {
+		return false;
+	}
+	try {
+		return GxLdBot.SupportLinkPositions(a.GetOrigin(), GxLdBot.SupportFlowFor(a),
+			b.GetOrigin(), GxLdBot.SupportFlowFor(b));
+	} catch (e) {}
+	return false;
+}
+
+// Survivors connected to an alive human without routing through excludedIdx.
+// With four survivors this tiny fixed-point walk is cheaper and clearer than a
+// general graph implementation. It is the real isolation anchor; centroid stays
+// available for telemetry/rubber-band history but no longer grants permission.
+function GxLdBot::HumanSupportCore(excludedIdx) {
+	local now = GxLdBot.Now();
+	if ((now - GxLdBot.SupportCoreCacheTime) >= GxLdBot.Settings.SupportCacheSeconds) {
+		GxLdBot.SupportCoreCacheTime = now;
+		GxLdBot.SupportCoreCache = {};
+	}
+	if (excludedIdx in GxLdBot.SupportCoreCache) {
+		return GxLdBot.SupportCoreCache[excludedIdx];
+	}
+	local members = [];
+	local connected = {};
+	GxLdBot.ForEachSurvivor(function(s) {
+		if (!GxLdBot.IsAlive(s) || s.GetEntityIndex() == excludedIdx) {
+			return;
+		}
+		members.append(s);
+		if (!GxLdBot.IsBot(s)) {
+			connected[s.GetEntityIndex()] <- true;
+		}
+	});
+	if (connected.len() <= 0) {
+		local empty = [];
+		GxLdBot.SetTableSlot(GxLdBot.SupportCoreCache, excludedIdx, empty);
+		return empty; // all-bot game: no human-anchored safety claim can be proven
+	}
+
+	local changed = true;
+	while (changed) {
+		changed = false;
+		foreach (i, candidate in members) {
+			local cidx = candidate.GetEntityIndex();
+			if (cidx in connected) {
+				continue;
+			}
+			foreach (j, anchor in members) {
+				local aidx = anchor.GetEntityIndex();
+				if (!(aidx in connected)) {
+					continue;
+				}
+				if (GxLdBot.SupportLinkEntities(candidate, anchor)) {
+					connected[cidx] <- true;
+					changed = true;
+					break;
+				}
+			}
+		}
+	}
+
+	local out = [];
+	foreach (i, s in members) {
+		if (s.GetEntityIndex() in connected) {
+			out.append(s);
+		}
+	}
+	GxLdBot.SetTableSlot(GxLdBot.SupportCoreCache, excludedIdx, out);
+	return out;
+}
+
+function GxLdBot::TargetHasHumanSupport(bot, pos, targetFlow) {
+	if (!GxLdBot.IsValidEntity(bot) || pos == null) {
+		return false;
+	}
+	if (!("HasAliveHuman" in GxLdBot) || !GxLdBot.HasAliveHuman()) {
+		return true; // preserve all-bot test behavior; human isolation law is N/A
+	}
+	local core = GxLdBot.HumanSupportCore(bot.GetEntityIndex());
+	foreach (i, member in core) {
+		try {
+			if (GxLdBot.SupportLinkPositions(pos, targetFlow, member.GetOrigin(),
+					GxLdBot.SupportFlowFor(member))) {
+				return true;
+			}
+		} catch (e) {}
+	}
+	return false;
 }
 
 // ---- Focus / attention -----------------------------------------------------
@@ -499,7 +780,7 @@ function GxLdBot::ScoutIntentFor(bot) {
 	if (!GxLdBot.TeamHasLeftSafeArea()) {
 		return null;
 	}
-	if ("TeamUnderStress" in GxLdBot && GxLdBot.TeamUnderStress()) {
+	if (("BotAllowsProgress" in GxLdBot) && !GxLdBot.BotAllowsProgress(bot)) {
 		return null;
 	}
 
